@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# 虚拟环境
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 日志
+*.log
+
+# 大型文件
+*.pdf
+*.mp4
+*.zip
+
+# 子模块
+sam-3d-objects/
+sam3/
+vggt/
+
+# 其他
+=4.45.0
+assets/
+hand_removal/
+stage4/
+outputs/
