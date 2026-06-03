@@ -6,7 +6,6 @@ __pycache__/
 dist/
 build/
 
-# 虚拟环境
 venv/
 env/
 .venv/
@@ -17,22 +16,41 @@ env/
 *.swp
 *.swo
 
-# 日志
 *.log
 
-# 大型文件
+# Large binary files
 *.pdf
 *.mp4
 *.zip
+*.pt
+*.ckpt
+*.safetensors
+*.pth
+*.bin
+*.onnx
+*.h5
+*.ply
+*.glb
+*.gltf
+*.obj
+*.stl
+*.fbx
 
-# 子模块
+# Large data directories
+output_v2/
+outputs/
+models/
+assets/
+hand_removal/
+stage4/
+
+# Submodule directories
 sam-3d-objects/
 sam3/
 vggt/
 
-# 其他
+# Test output
+object_tracking/test_output/
+
+# Misc
 =4.45.0
-assets/
-hand_removal/
-stage4/
-outputs/

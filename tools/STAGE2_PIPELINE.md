@@ -1,51 +1,45 @@
-# ReplicateAnyScene Stage 2 管线汇总与使用示例
+# ReplicateAnyScene Stage 2 管线文档
+
+> 代码文件: `tools/generate_scene_json_stage1.py`
 
 ## 环境要求
 
-- Python 3.11+
-- PyTorch 2.0+
-- 依赖项安装: `pip install -r requirements.txt`
-- **关键模型要求**:
-  - VLM模型: Qwen3.5-9B (默认路径 `/mnt/data/lza/models/Qwen3.5-9B`)
-  - VGGT模型: 本地已有权重
-  - SAM3模型: 可选，用于floor/wall分割 + floor重叠检测
+- Python 3.11+, PyTorch 2.0+
+- VLM模型: Qwen3.5-9B (默认 `/mnt/data/lza/models/Qwen3.5-9B`)
+- VGGT模型: 本地已有权重
+- SAM3模型: 可选，用于floor/wall分割 + floor重叠检测
+- sklearn: 可选，用于DBSCAN聚类（无sklearn时降级为体素聚类）
 
 ---
 
 ## 命令行参数
 
-| 参数                          | 必需 | 默认值                   | 说明                                                                    |
-| ----------------------------- | ---- | ------------------------ | ----------------------------------------------------------------------- |
-| `--input_video`             | ✅   | -                        | 输入视频路径                                                            |
-| `--output_json`             | ❌   | 自动生成                 | 输出JSON路径，默认 `./assets/json_configs/scene_<视频名>_stage2.json` |
-| `--vlm_checkpoint`          | ❌   | 自动查找                 | VLM模型路径，默认 `/mnt/data/lza/models/Qwen3.5-9B`                   |
-| `--max_frames`              | ❌   | 10                       | VGGT采样最大关键帧数                                                    |
-| `--temp_dir`                | ❌   | `./temp_frames_stage2` | 临时帧存储目录                                                          |
-| `--centroid_dist_thre`      | ❌   | 0.15                     | 3D去重质心距离阈值(米)                                                  |
-| `--use_sam`                 | ❌   | `auto`                 | SAM3分割:`auto`(自动判断)/`yes`(强制)/`no`(禁用)                  |
-| `--no_supplementary_detect` | ❌   | `False`                | 禁用点云补充检测（默认启用）                                            |
+| 参数 | 必需 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--input_video` | ✅ | - | 输入视频路径 |
+| `--output_json` | ❌ | 自动生成 | 输出JSON路径，默认 `./assets/json_configs/scene_<视频名>_stage2.json` |
+| `--output_dir` | ❌ | 与output_json同目录 | 输出目录 |
+| `--vlm_checkpoint` | ❌ | 自动查找 | VLM模型路径 |
+| `--max_frames` | ❌ | 10 | VGGT采样最大关键帧数 |
+| `--temp_dir` | ❌ | `./temp_frames_stage2` | 临时帧存储目录 |
+| `--centroid_dist_thre` | ❌ | 0.15 | 3D去重质心距离阈值(米) |
+| `--use_sam` | ❌ | `auto` | SAM3分割: `auto`/`yes`/`no` |
+| `--no_supplementary_detect` | ❌ | False | 禁用点云补充检测（默认启用） |
 
 ---
 
-## 完整运行示例: `beizi.mp4`
-
-### 基本用法（使用默认参数）
+## 运行示例
 
 ```bash
 cd /mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene
-/mnt/data/lza/conda_envs/ReplicateAnyScene/bin/python tools/generate_scene_json_stage2.py \
+
+# 基本用法
+/mnt/data/lza/conda_envs/ReplicateAnyScene/bin/python tools/generate_scene_json_stage1.py \
   --input_video assets/example/beizi.mp4
-```
 
-### 完整参数示例
-
-```bash
-/mnt/data/lza/conda_envs/ReplicateAnyScene/bin/python tools/generate_scene_json_stage2.py \
-  --input_video assets/example/beizi.mp4 \
-  --output_json my_result.json \
-  --vlm_checkpoint /mnt/data/lza/models/Qwen3.5-9B \
-  --max_frames 10 \
-  --use_sam auto
+# 禁用点云补充检测
+/mnt/data/lza/conda_envs/ReplicateAnyScene/bin/python tools/generate_scene_json_stage1.py \
+  --input_video assets/example/beizi.mp4 --no_supplementary_detect
 ```
 
 ---
@@ -56,69 +50,61 @@ cd /mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene
 视频输入
   │
   ▼
-┌─────────────────────────────────┐
-│ Step 0: VGGT 3D场景重建          │
-│   输入: 完整视频                  │
-│   输出: 3D点云 + 相机外参/内参     │
-└──────────────┬──────────────────┘
-               │
+┌──────────────────────────────┐
+│ Step 0: VGGT 3D场景重建       │
+│   输出: 3D点云 + 相机参数      │
+└──────────────┬───────────────┘
                ▼
-┌─────────────────────────────────┐
-│ Step 1: SimRecon 关键帧采样       │
-│   贪心最大覆盖算法选择关键帧        │
-│   输出: 关键帧索引列表             │
-└──────────────┬──────────────────┘
-               │
+┌──────────────────────────────┐
+│ Step 1: SimRecon关键帧采样    │
+│   贪心最大覆盖 → 关键帧索引    │
+└──────────────┬───────────────┘
                ▼
-┌─────────────────────────────────┐
-│ Step 2: 提取关键帧图像            │
-│   ffmpeg按索引提取帧图片           │
-│   输出: [(vid_idx, frame_path)]  │
-└──────────────┬──────────────────┘
+┌──────────────────────────────┐
+│ Step 2: ffmpeg提取关键帧图像   │
+│   输出: [(vid_idx, path)]     │
+└──────────────┬───────────────┘
                │
       ┌────────┴────────┐
       ▼                 ▼
-┌──────────────┐  ┌──────────────────────┐
-│ 第一部分:     │  │ 辅助: SAM分割         │
-│ 物体发现+去重 │  │ Step 6                │
-│ Step 3-5     │  │ floor/wall检测        │
-│              │  │ + 关键帧floor mask     │
-│              │  │ (选择最像地板的mask)    │
-└──────┬───────┘  └────────┬─────────────┘
-       │                   │
-       ▼                   ▼
-┌─────────────────────────────────────────┐
-│ Step 5.5: 点云补充检测                    │
-│   分析VGGT点云中未被VLM覆盖的3D聚类       │
-│   → DBSCAN聚类 → 过滤大小/形状            │
-│   → 裁剪2D区域 → VLM识别                  │
-│   → 用点云大小/位置决定是否采纳            │
-│   (利用SAM floor mask排除floor区域)       │
-└──────────────┬──────────────────────────┘
-               │
+┌──────────────┐  ┌───────────────────────┐
+│ Step 3: VLM  │  │ Step 6: SAM分割       │
+│ 物体检测      │  │ floor/wall检测        │
+│ (名称+bbox)  │  │ + 关键帧floor mask    │
+│      ▼        │  │ (选择最像地板的mask)   │
+│ Step 4: 射线  │  └───────────┬───────────┘
+│ 投射→3D位置   │              │
+│      ▼        │              │
+│ Step 5: 语义  │
+│ 去重(SYN+CLIP)│              │
+└──────┬────────┘              │
+       │                       │
+       ▼                       ▼
+┌──────────────────────────────────────────┐
+│ Step 5.5: 点云补充检测                     │
+│   VGGT点云 → 排除已知物体+floor → DBSCAN  │
+│   → 过滤大小/形状 → 裁剪2D → VLM识别       │
+└──────────────┬───────────────────────────┘
                ▼
-┌─────────────────────────────────────────┐
-│ 第二部分: 关系判断 (Step 7)              │
-│                                         │
-│ 7.1 SAM floor预判断 (bbox与floor mask重叠)│
-│     → 重叠>=30% → 直接判定"supported by  │
-│       floor"，不经过VLM                  │
-│                                         │
-│ 7.2 Per-frame可见性映射                   │
-│     → 物体在哪帧出现 → 只在该帧判断       │
-│                                         │
-│ 7.3 VLM多帧推理 (仅判断可见物体)          │
-│     → 每帧独立prompt + 后处理纠错         │
-│                                         │
-│ 7.4 汇总: SAM预判断 + VLM投票            │
-└──────────────┬──────────────────────────┘
-               │
+┌──────────────────────────────────────────┐
+│ Step 7: 关系判断                           │
+│   7.1 SAM floor预判断 (bbox底部与floor重叠) │
+│   7.2 Per-frame可见性映射                   │
+│   7.3 VLM多帧推理 (仅可见物体)              │
+│   7.4 物理常识后处理纠错                    │
+│   7.5 汇总: SAM预判断 + VLM多帧投票         │
+└──────────────┬───────────────────────────┘
                ▼
-┌─────────────────────────────────┐
-│ Step 8: 输出场景JSON             │
-│   过滤floor/wall，保存最终结果     │
-└─────────────────────────────────┘
+┌──────────────────────────────┐
+│ Step 8: 保存场景JSON          │
+│ Step 9: 保存关键帧到          │
+│   assets/key_frames/<视频名>/ │
+└──────────────────────────────┘
 ```
+
+**执行顺序**: Step 0→1→2→3→4→5→**6**→**5.5**→7→8→9
+
+> 注意: Step 6 (SAM) 在 Step 5.5 之前执行，因为 Step 5.5 需要 SAM 的 floor mask 来排除 floor 区域。
 
 ---
 
@@ -127,98 +113,17 @@ cd /mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene
 ### Step 0: VGGT 3D场景重建
 
 - 输入: 完整视频（最多160帧）
-- 输出: 3D点云 `world_points`、置信度 `world_points_conf`、相机外参 `extrinsics`、内参 `intrinsic`
-- 目的: 构建场景的3D几何结构，为后续射线投射和采样提供基础
+- 输出: `world_points`(3D点云), `world_points_conf`(置信度), `extrinsics`(外参), `intrinsic`(内参), `colors`(帧颜色)
+- VGGT模型用完后立即卸载释放显存
 
 ### Step 1: SimRecon 关键帧采样
 
-- **输入**: 相机外参 + 3D点云 + 置信度
-- **输出**: 覆盖整个场景的关键帧索引列表
-- **方法**: 贪心最大覆盖算法（`maximum_coverage_sampling`）
-
-#### 1.1 体素化3D空间
-
-将连续的3D点云离散化为体素网格，便于计算覆盖率：
-
-```python
-# 计算场景边界盒
-x_min, y_min, z_min = valid_points.min(axis=0)
-x_max, y_max, z_max = valid_points.max(axis=0)
-scene_extent = max(x_max - x_min, y_max - y_min, z_max - z_min)
-
-# 体素大小按场景最小维度/20计算
-voxel_size = max(scene_extent / 20.0, 0.01)
-
-# 将3D点映射到体素坐标
-voxel_coords = np.floor((points - offset) / voxel_size).astype(int)
-```
-
-**关键设计**:
-- **自适应体素大小**: 根据场景尺度自动调整，避免过大（丢失细节）或过小（计算量大）
-- **坐标偏移量**: 使用 `(x_min, y_min, z_min)` 作为偏移，提高体素离散化精度
-- **全局置信度阈值**: 筛选置信度 >= 50%分位数 且 > 0.1 的点，排除低质量点云
-
-#### 1.2 贪心最大覆盖算法
-
-**核心思想**: 每轮选择能覆盖最多**未覆盖体素**的帧，直到达到目标帧数。
-
-**算法流程**:
-
-```
-初始化:
-  selected = []          # 已选帧列表
-  covered = {}           # 已覆盖的体素集合
-  remaining = {0,1,...,T-1}  # 待选帧集合
-
-循环 K 次 (K = max_frames):
-  1. 对每个候选帧 f ∈ remaining:
-     gain(f) = |voxels(f) - covered|  # 该帧能新增的体素数
-  
-  2. 选择增益最大的帧:
-     best_frame = argmax(gain(f))
-  
-  3. 更新状态:
-     selected.append(best_frame)
-     covered.update(voxels(best_frame))
-     remaining.remove(best_frame)
-  
-  4. 终止条件:
-     - 达到K帧
-     - 无新增覆盖 (gain=0)
-     - 无剩余帧
-
-返回 sorted(selected)
-```
-
-**示例执行过程**:
-
-```
-🎯 第1轮: 选择帧#15, 新增3250个体素, 累计覆盖3250个
-🎯 第2轮: 选择帧#42, 新增2180个体素, 累计覆盖5430个
-🎯 第3轮: 选择帧#8,  新增1520个体素, 累计覆盖6950个
-...
-📊 最终覆盖率: 8750/9500 体素 (92.1%)
-```
-
-#### 1.3 算法优势
-
-| 特性 | 说明 |
-|------|------|
-| **最大化空间覆盖** | 确保选中的帧能从不同角度覆盖场景的3D空间 |
-| **视角多样性** | 贪心策略自然倾向于选择视角差异大的帧 |
-| **计算高效** | O(K×T) 复杂度，K为目标帧数，T为总帧数 |
-| **无需预定义规则** | 不依赖启发式规则（如每隔N帧采样），自适应场景结构 |
-| **可解释性强** | 每轮选择的增益清晰可见，便于调试和优化 |
-
-#### 1.4 与SimRecon的关系
-
-本实现参考 `SimRecon/coverage_sampling.py`，采用相同的:
-- 体素化策略（场景维度/20）
-- 置信度过滤（50%分位数 + >0.1）
-- 坐标偏移量处理
-- 贪心最大覆盖算法
-
-**目标**: 在10帧内实现90%+的体素覆盖率，为后续物体检测提供充分的视角覆盖。
+- 输入: 相机外参 + 3D点云 + 置信度
+- 输出: 关键帧索引列表
+- 方法: 贪心最大覆盖算法
+  1. 体素化3D空间（体素大小 = 场景最大维度 / 20）
+  2. 置信度过滤: >= 50%分位数 且 > 0.1
+  3. 每轮选覆盖最多新体素的帧，直到达到 `max_frames` 或无新增覆盖
 
 ### Step 2: 提取关键帧
 
@@ -233,42 +138,79 @@ voxel_coords = np.floor((points - offset) / voxel_size).astype(int)
 #### Step 3: VLM 第一次调用 — 物体检测
 
 - 输入: 关键帧图片
-- 输出: 每帧的物体名称列表 + 2D中心坐标 + **bbox边界框**
-- 提示词设计:
-  - 只检测可见物体，输出 `{"objects": [{"name": "cup"}, ...]}`
-  - 忽略 hands, body parts, walls, floors, ceilings
-  - 每种物体每帧只列一次
+- 输出: `all_detections = [{"frame_idx", "frame_path", "objects": [{name, center_x, center_y, bbox}]}]`
+- Prompt: `"List all visible objects in this image. Output JSON only."`
 - 兼容性处理:
-  - VLM可能输出 `label` 而非 `name` → 自动转换
-  - VLM可能输出 `bbox_2d` 而非 `center_x/center_y` → 从bbox计算中心点
-  - **bbox信息保留**，用于后续SAM floor重叠检测
-  - 无位置信息时默认使用图像中心
-- **重要**: `all_detections` 的结果会传递到 Step 7，用于 per-frame 可见性过滤
+  - `label` → `name` 自动转换
+  - `bbox_2d` → 计算 `center_x/center_y`，保留 `bbox`
+  - 无位置信息 → 默认图像中心
+- **重要**: `all_detections` 传递到 Step 7 用于 per-frame 可见性过滤
 
 #### Step 4: 射线投射 — 3D位置估计
 
-- 输入: 2D检测坐标 + VGGT结果（点云、外参、内参）
+- 输入: 2D检测坐标 + VGGT点云
 - 输出: 每个物体实例的3D质心 `centroid`
-- 方法: 射线投射 (`pixel_to_3d_position`)
-  1. 从相机中心沿像素方向发射射线
-  2. 计算射线到点云中所有点的距离
-  3. 取距离最近的前K个点（`RAY_CAST_TOP_K=5`）
-  4. 中值滤波得到3D位置
+- 方法: 从相机中心沿像素方向发射射线，取距离最近的前5个点（`RAY_CAST_TOP_K=5`），中值滤波
 
-#### Step 5: 去重
+#### Step 5: 语义去重（SYNONYM_MAP + CLIP）
 
 - 输入: 所有帧的物体实例
 - 输出: 唯一物体列表
-- 方法: 名称匹配去重（同名物体直接合并为一个）
-  - 先通过 `merge_synonyms` 合并同义词
-  - 同名物体的3D质心取中值
-  - 同义词映射示例:
-    - `ground` / `flooring` / `carpet` / `rug` → `floor`
-    - `walling` / `walls` → `wall`
-    - `mug` / `glass` / `tumbler` → `cup`
-    - `sofa` / `settee` → `couch`
-    - `desk` / `dining table` → `table`
-    - `television` / `monitor` / `display` → `tv`
+- 方法: **三层联合去重**
+
+**第一层: SYNONYM_MAP 精确匹配**（硬编码常见同义词）:
+  - `ground`/`flooring`/`carpet`/`rug` → `floor`
+  - `walling`/`walls` → `wall`
+  - `mug`/`glass`/`tumbler` → `cup`
+  - `sofa`/`settee` → `couch`
+  - `desk`/`dining table` → `table`
+  - `television`/`monitor`/`display` → `tv`
+  - `potted plant`/`flowerpot` → `plant`
+
+**第二层: CLIP 语义匹配**（发现 SYNONYM_MAP 未覆盖的同义词）:
+  - 加载 `CLIPSemanticMatcher`（clip-vit-base-patch32）
+  - 对所有去重后的候选名称两两计算文本相似度
+  - 相似度 >= `CLIP_MERGE_THRESHOLD`（0.90）→ 视为同义，合并
+  - 合并方向: SYNONYM_MAP 中的名称优先保留，否则保留实例数更多的
+  - 示例: `"trash can"` ≈ `"garbage can"` (CLIP相似度=0.92) → 合并为 `"trash_can"`
+
+**第三层: 名称标准化**（`normalize_category_name`）:
+  - 小写、去复数（`chairs` → `chair`，`shelves` → `shelv` 等）
+
+**降级策略**: CLIP 不可用时仅使用 SYNONYM_MAP + 名称标准化
+
+---
+
+### Step 6: SAM3 分割 floor 和 wall
+
+- 输入: 关键帧图片 + VGGT结果
+- 输出: `sam_results = {'has_floor', 'has_wall', 'floor_masks', 'wall_masks', 'keyframe_floor_masks'}`
+
+**两阶段分割**:
+
+**阶段1**: 对VGGT颜色帧做SAM分割 → 获取 `has_floor`/`has_wall`
+
+**阶段2**: 对每个关键帧单独做SAM floor分割 → 获取 `keyframe_floor_masks`
+
+**Floor mask 选择逻辑**（与 main.py `align_to_room_coordinate_system` 一致）:
+
+当SAM对一帧返回多个floor mask候选时，用3D几何信息选择最像地板的那个：
+
+```
+多个 floor mask 候选
+  │
+  ├─ 只有1个 → 直接使用
+  │
+  ├─ 有多个 + 有world_points:
+  │   1. get_plane_info: PCA拟合平面 → normal, area, mean_distance
+  │   2. 过滤: mean_distance > 0.02 → 丢弃（不像平面）
+  │   3. 过滤: 法向量偏离平均法向量 > 30° → 丢弃（如桌面误分）
+  │   4. 选择: 面积最大的 → 最像地板
+  │
+  └─ 有多个 + 无world_points → 降级合并所有mask
+```
+
+**降级策略**: SAM3不可用 → `has_floor`/`has_wall` 默认 True，无 `keyframe_floor_masks`
 
 ---
 
@@ -276,60 +218,158 @@ voxel_coords = np.floor((points - offset) / voxel_size).astype(int)
 
 **问题**: VLM对近处物体检测效果好，但可能遗漏远端的大物体（如远处的柜子、书架等）。
 
-**方案**: 保留原有VLM检测，新增基于点云的补充检测，用点云大小/位置决定是否采纳。
+**方案**: 保留原有VLM检测，通过分析VGGT点云中未被检测物体覆盖的显著3D聚类，补充检测远端大物体。
 
 #### 5.5.1 提取高置信度3D点
 
-- 从VGGT点云中采样5帧，提取置信度 > 1.5 的3D点
-- 体素降采样（5cm体素），减少计算量
+从VGGT点云中提取可靠3D点，作为后续聚类的基础：
 
-#### 5.5.2 排除已知物体和floor/wall区域
+```
+VGGT world_points: shape (T, H, W, 3)  — T帧，每帧H×W个3D点
+VGGT world_points_conf: shape (T, H, W) — 每个点的置信度
 
-- 排除距离已知物体质心 < 0.3m 的点（已被VLM检测到）
-- 利用SAM关键帧floor mask，排除属于floor区域的3D点
+采样策略:
+  - 从T帧中等间隔采样5帧 (sample_step = T // 5)
+  - 对每帧:
+    1. 统计置信度分布: min, max, 均值, 中位数
+    2. 动态阈值: max(50%分位数, 0.1)  — 自适应不同场景的置信度分布
+    3. 提取置信度 > 阈值的3D点
+    4. 体素降采样 (5cm体素) — 减少计算量，保持空间均匀性
 
-#### 5.5.3 DBSCAN聚类
+合并所有帧的降采样点 → all_points (float32)
+```
 
-- 对剩余点做DBSCAN聚类（eps=0.15m, min_samples=30）
-- 每个聚类代表一个潜在的未检测物体
+**为什么用动态阈值而非固定阈值**: 不同视频的VGGT置信度分布差异很大，固定阈值（如1.5）在某些场景可能过滤掉太多或太少点。50%分位数自适应地选择"上半部分"高质量点。
 
-#### 5.5.4 过滤聚类（用点云大小/位置决定）
+#### 5.5.2 排除已知物体附近的点
 
-| 过滤规则   | 条件                         | 原因                |
-| ---------- | ---------------------------- | ------------------- |
-| 过小       | 体积 < 0.005m³              | 噪声或小碎片        |
-| 过大       | 体积 > 8m³                  | 可能是墙/地板       |
-| 过扁       | 最薄维度 < 3cm 且最长 > 1.5m | 平面结构（墙/地板） |
-| 长宽比过大 | max_dim/min_dim > 30         | 线状结构（管道等）  |
-| 点数过少   | < 50个点                     | 稀疏噪声            |
+```
+已知物体: unique_objects 中每个物体的 3D centroid
 
-#### 5.5.5 VLM识别
+排除方法:
+  对 all_points 中的每个点:
+    计算到所有已知物体质心的最小距离
+    如果最小距离 < 0.3m → 排除（该点属于已被VLM检测到的物体）
 
-- 对每个候选聚类：
-  1. 将3D质心投影到最佳关键帧的2D像素位置
-  2. 裁剪 300×300 像素区域
-  3. 用VLM识别: "What is the large object in the center?"
-  4. 过滤: "none" → 跳过，FILTER_CATEGORIES → 跳过，已存在同名 → 跳过
-- 最多识别5个候选聚类（按体积降序）
+结果: 只保留"远离已知物体"的点
+```
 
-#### 5.5.6 结果合并
+**为什么是0.3m**: 一般物体的3D质心在其几何中心，0.3m足以覆盖常见物体的范围（椅子~0.4m，杯子~0.1m），同时不会误排除远处的独立物体。
 
-- 新检测到的物体添加到 `unique_objects`
-- 后续进入 Step 7 关系判断流程
+#### 5.5.3 排除floor区域的点
+
+利用Step 6的 `keyframe_floor_masks` 排除属于地板的3D点：
+
+```
+对每个关键帧的 floor_mask:
+  1. 从 world_points[frame_idx] 中提取 mask 对应的3D点
+  2. 体素降采样 (10cm体素) → floor_3d_points 集合
+     (用体素坐标的tuple作为集合key，加速查找)
+
+对 all_points 中的每个点:
+  计算其10cm体素坐标
+  如果该体素在 floor_3d_points 中 → 排除
+
+结果: 只保留"不在地板上"的点
+```
+
+**为什么用体素集合而非逐点距离**: floor mask可能包含数十万个3D点，逐点计算距离太慢。体素化后用集合查找，O(1)复杂度。
+
+#### 5.5.4 DBSCAN聚类
+
+对剩余的"未知"3D点做聚类，找出独立的3D区域：
+
+```
+DBSCAN参数:
+  eps = 0.15m    — 两个点距离<15cm视为邻居
+  min_samples = 30 — 一个聚类至少30个点
+
+聚类结果: labels 数组
+  label = -1: 噪声点
+  label >= 0: 属于某个聚类
+
+降级: sklearn不可用时 → 简单体素聚类 (10cm体素，同体素的点归为一类)
+```
+
+**为什么选这些参数**: `eps=0.15m` 适合室内场景中物体的尺度（家具通常>15cm），`min_samples=30` 过滤掉零散噪声点。
+
+#### 5.5.5 过滤聚类（用点云大小/形状决定）
+
+对每个聚类计算几何特征，过滤不像物体的聚类：
+
+```
+对每个聚类:
+  1. centroid = 所有点的均值 (3D质心)
+  2. bbox_extent = 各轴的极差 (ptp) → [dx, dy, dz]
+  3. volume = dx × dy × dz
+
+过滤规则:
+  ┌─────────────┬────────────────────────────┬──────────────────────┐
+  │ 规则         │ 条件                        │ 原因                 │
+  ├─────────────┼────────────────────────────┼──────────────────────┤
+  │ 点数过少     │ < 50个点                    │ 稀疏噪声             │
+  │ 体积过小     │ < 0.005m³                   │ 小碎片/噪声          │
+  │ 体积过大     │ > 8m³                       │ 可能是墙/地板        │
+  │ 过扁         │ 最薄<3cm 且 最长>1.5m       │ 平面结构(墙/地板)    │
+  │ 长宽比过大   │ max_dim/min_dim > 30        │ 线状结构(管道等)     │
+  └─────────────┴────────────────────────────┴──────────────────────┘
+
+按体积降序排列，最多取前5个候选
+```
+
+**为什么这些过滤规则有效**:
+- **体积过滤**: 真实物体通常在 0.01~5 m³ 范围内，超出范围的大概率是场景结构
+- **扁平过滤**: 墙壁/地板的特征是"很薄但很宽"（如 2cm × 3m × 2m），真实物体不会这么扁
+- **长宽比过滤**: 管道/栏杆等线状结构不是我们要检测的物体
+
+#### 5.5.6 VLM识别
+
+对每个候选聚类，投影到2D图像并裁剪，用VLM识别：
+
+```
+对每个候选聚类:
+  1. 3D→2D投影: 找最佳关键帧
+     - 将3D质心投影到每个关键帧的2D像素位置
+       (在world_points中找距离质心最近的像素)
+     - 选择条件:
+       a. 投影位置不在图像边缘 (距边缘 > 150px)
+       b. 投影位置的3D点与质心距离 < 0.5m (深度一致性)
+     - 按 1/(距离+0.01) 打分，选最佳帧
+
+  2. 裁剪图像: 以投影位置为中心，裁剪 300×300 像素区域
+
+  3. VLM识别: "What is the large object in the center of this cropped image?"
+     输出: {"name": "object_name"} 或 {"name": "none"}
+
+  4. 过滤:
+     - "none"/"null"/"unknown" → 跳过
+     - 属于 FILTER_CATEGORIES (floor/wall/...) → 跳过
+     - 与 unique_objects 中已有物体同名 → 跳过
+
+  5. 采纳: 通过所有过滤 → 添加到 unique_objects
+     记录: name, centroid, source='pointcloud_supplementary', volume, point_count
+```
+
+**为什么裁剪300×300**: 远端物体在原图中很小，裁剪放大后VLM能看清细节。300px足够包含一个物体的局部特征。
+
+**为什么用专门的prompt而非复用检测prompt**: 裁剪图像中只有一个物体居中，用简单直接的识别prompt效果更好，避免VLM尝试检测多个物体。
 
 **示例输出**:
-
 ```
 🔎 Step 5.5: 点云补充检测 — 发现遗漏的远端大物体
    已知物体: 4 个
-   📊 降采样后点云: 12580 个点
-   排除已知物体附近点后: 8320 个点
-   排除floor区域点后: 5100 个点
-   🔮 DBSCAN聚类: 12 个聚类
-   ✅ 过滤后候选聚类: 3 个
+   🔍 采样帧索引: [0, 32, 64, 96, 128]
+      帧#0: 置信度范围 [0.050, 3.200], 均值=1.420, 中位数=1.380, 有效点数=28900
+      → 提取 1520 个点 (阈值=1.380)
+      帧#32: 置信度范围 [0.030, 2.980], 均值=1.350, 中位数=1.310, 有效点数=27500
+      → 提取 1380 个点 (阈值=1.310)
+   📊 降采样后点云: 8500 个点
+   排除已知物体附近点后: 5200 个点
+   排除floor区域点后: 3100 个点
+   🔮 DBSCAN聚类: 8 个聚类
+   ✅ 过滤后候选聚类: 2 个
       候选1: 质心=[1.2, -0.8, 0.5], 尺寸=[0.6, 0.4, 1.2], 体积=0.288, 点数=380
-      候选2: 质心=[-1.5, 2.1, 0.3], 尺寸=[0.8, 0.3, 0.9], 体积=0.216, 点数=290
-   [1/3] 识别候选聚类 (质心=[1.2, -0.8, 0.5])...
+   [1/2] 识别候选聚类 (质心=[1.2, -0.8, 0.5])...
       ✅ 新发现: bookshelf (体积=0.288, 点数=380)
    🎉 补充检测发现 1 个新物体:
       - bookshelf (质心=[1.2, -0.8, 0.5])
@@ -337,43 +377,11 @@ voxel_coords = np.floor((points - offset) / voxel_size).astype(int)
 
 ---
 
-### 辅助: SAM3 语义分割 (Step 6)
-
-#### Step 6: SAM3 分割 floor 和 wall
-
-- 输入: 关键帧图片 + VGGT结果
-- 输出: `sam_results = {'has_floor', 'has_wall', 'floor_masks', 'wall_masks', 'keyframe_floor_masks'}`
-- **新增**: `keyframe_floor_masks: {frame_idx: numpy(H,W)}` — 每个关键帧的floor mask
-- 目的:
-  1. 为关系判断提供 floor/wall 可见性信息（`has_floor`/`has_wall`）
-  2. **为SAM floor重叠检测提供逐帧floor mask**（`keyframe_floor_masks`）
-  3. **为点云补充检测提供floor区域排除信息**
-- 实现细节:
-  - 先对VGGT颜色帧做SAM分割（获取 `has_floor`/`has_wall`）
-  - 再对每个关键帧单独做SAM floor分割（获取 `keyframe_floor_masks`）
-  - **Floor mask选择逻辑**（与main.py `align_to_room_coordinate_system`一致）:
-    1. 只有1个候选 → 直接使用
-    2. 有多个候选 → 用 `get_plane_info` 计算3D平面信息:
-       - 过滤: `mean_distance > 0.02` → 丢弃（不像平面）
-       - 过滤: 法向量偏离平均法向量 > 30° → 丢弃（错误分割，如桌面）
-       - 选择: **面积最大的** → 最像地板
-    3. 无world_points时 → 降级合并所有mask
-  - SAM模型在两步完成后才卸载，避免重复加载
-- 降级策略:
-  - SAM3不可用时 → 回退到默认值（floor和wall均视为可见，无keyframe floor mask）
-  - `--use_sam no` → 跳过SAM分割
-
----
-
 ### 第二部分: 关系判断 (Step 7)
 
 #### Step 7: 关系判断 — SAM预判断 + Per-frame VLM推理 + 多帧投票
 
-这是整个管线的核心判断步骤，采用 **"SAM floor预判断 → Per-frame可见性过滤 → VLM多帧推理 → 物理常识后处理纠错 → 多帧投票"** 的架构。
-
 ##### 7.1 预处理: 过滤场景结构物体
-
-在构建VLM prompt之前，先将 floor/wall/ceiling 等场景结构物体从物体列表中移除：
 
 ```
 原始物体列表: [floor, chair, table, cup, wall, clock]
@@ -381,155 +389,108 @@ voxel_coords = np.floor((points - offset) / voxel_size).astype(int)
 待判断物体列表: [chair, table, cup, clock]
 ```
 
-- **floor/wall 不参与VLM关系判断**，它们只作为场景上下文信息（`has_floor`/`has_wall`）传递给prompt
-- 这确保了 floor 只有一个（通过 Step 5 的同义词合并已保证），且不浪费VLM判断能力
 - `FILTER_CATEGORIES = {floor, wall, ground, ceiling, floor_area, wall_section, flooring, wall_surface, room, space}`
+- floor/wall 只作为场景上下文 (`has_floor`/`has_wall`) 传递给prompt
+- 通过 `SYNONYM_MAP` + Step 5 去重，floor 只有一个
 
-##### 7.2 SAM floor 预判断（几何方法，非VLM）
+##### 7.2 SAM floor 预判断（几何方法）
 
-使用SAM分割得到的floor mask，通过**几何重叠检测**判断物体是否在地板上：
+用SAM的floor mask通过**几何重叠检测**判断物体是否在地板上：
 
-**检测逻辑** (`_check_object_on_floor`):
-
-1. 取物体bbox的**底部30%区域**（靠近地面的部分）
-2. 计算该底部区域与SAM floor mask的重叠像素比例
-3. 若重叠比例 >= `FLOOR_OVERLAP_THRESHOLD`（默认30%），判定物体在地板上
+**`_check_object_on_floor(bbox, floor_mask, threshold=0.3)`**:
+1. 取物体bbox的**底部30%区域**
+2. 计算该底部区域与floor mask的像素重叠比例
+3. 重叠 >= 30% → 判定在地板上
 
 ```
 物体bbox:  ┌──────────┐
-           │          │
            │  上部70%  │  ← 不检查
            │──────────│
            │  底部30%  │  ← 检查与floor mask重叠
            └──────────┘
                ↕
-         SAM floor mask (绿色区域)
+         SAM floor mask
 ```
 
-**预判断流程** (`_sam_prejudge_floor`):
-
+**`_sam_prejudge_floor(all_detections, keyframe_floor_masks)`**:
 1. 遍历每个关键帧的检测结果
-2. 对每个有bbox的物体，检查其底部与该帧floor mask的重叠
-3. 若**任一帧**中重叠 >= 30%，标记该物体为 "supported by floor"
+2. 对每个有bbox的物体，检查底部与该帧floor mask的重叠
+3. **任一帧**重叠 >= 30% → 标记为 "supported by floor"
 4. SAM预判断的物体**直接确定关系，不再经过VLM**
-
-**示例输出**:
-
-```
-🏠 7.1 SAM floor预判断...
-   chair: ✅ 在地板上 (最大重叠率: 85.2%, 检查帧数: 3)
-   table: ✅ 在地板上 (最大重叠率: 72.1%, 检查帧数: 3)
-   cup: ❌ 不在地板上 (最大重叠率: 5.3%, 检查帧数: 2)
-   clock: ❌ 不在地板上 (最大重叠率: 0.0%, 检查帧数: 1)
-🏠 SAM判定在地板上的物体: {'chair', 'table'}
-```
-
-**优势**:
-
-- **几何方法比VLM更可靠**: 直接检测物体底部是否接触地板，而非依赖VLM的语义理解
-- **减少VLM工作量**: SAM预判断的物体不再需要VLM推理
-- **可解释性**: 重叠比例是可量化的，便于调试
 
 ##### 7.3 Per-frame 可见性映射
 
-利用 Step 3 的检测结果，构建每帧的物体可见性映射：
+利用 Step 3 的 `all_detections` 构建每帧的物体可见性：
 
 ```python
 frame_visibility = {
     frame_idx_0: {'chair', 'table', 'cup'},
     frame_idx_1: {'chair', 'clock'},
-    frame_idx_2: {'table', 'cup', 'clock'},
     ...
 }
 ```
 
 **关键规则**: 物体在某帧没出现 → 该帧不对该物体做VLM判断 → 不产生默认投票
 
-**旧逻辑问题**:
+##### 7.4 VLM 多帧推理
 
-```
-旧: 所有帧都判断所有物体 → 物体在某帧不可见 → VLM可能乱猜或跳过 → 默认"supported by floor"
-新: 只在该物体可见的帧做判断 → 不可见帧直接跳过 → 不会产生错误投票
-```
-
-##### 7.4 VLM 多帧推理（仅判断可见物体）
-
-对每个关键帧，只对该帧**可见且未被SAM预判断**的物体调用VLM：
+只对**可见且未被SAM预判断**的物体调用VLM：
 
 ```python
+objects_to_query = [n for n in object_names if n not in sam_floor_objects]
+
 for vid_idx, frame_path in frame_paths_with_indices:
     visible_in_frame = frame_visibility.get(vid_idx, set())
     frame_objects = [n for n in objects_to_query if n in visible_in_frame]
-
     if not frame_objects:
         continue  # 该帧无待判断物体，跳过
-
     frame_prompt = _build_relationship_prompt(frame_objects, has_floor, has_wall)
-    output_text = _vlm_inference(image, model, processor, frame_prompt)
     ...
 ```
 
-- **每帧使用独立的prompt**，只包含该帧可见的物体
-- VLM从不同视角观察不同的物体子集，给出关系判断
-- 每帧结果先经过后处理纠错，再计入投票
-
 **4种空间关系**:
-
-1. `supported by floor`: 直接放在地面/地板上（如桌子、椅子、柜子）
-2. `supported by other objects`: 放在其他物体上（如桌上的杯子、椅上的枕头）
-3. `attached to wall`: 挂在墙上（如画框、时钟、窗帘）
-4. `embedded in wall`: 嵌入墙内（如门、窗、插座）
+1. `supported by floor`: 直接放在地面上
+2. `supported by other objects`: 放在其他物体上
+3. `attached to wall`: 挂在墙上
+4. `embedded in wall`: 嵌入墙内
 
 ##### 7.5 物理常识后处理纠错
 
-`_post_process_relationships(relationships, object_names)` 对每帧的VLM输出进行纠错：
+`_post_process_relationships` 对每帧VLM输出纠错：
 
-| 规则               | 物体类别                                                                           | VLM错误判断                         | 纠正为             | 原因                    |
-| ------------------ | ---------------------------------------------------------------------------------- | ----------------------------------- | ------------------ | ----------------------- |
-| 家具必须在地面     | cabinet, table, chair, sofa, bed, desk, shelf, refrigerator, plant, box, carpet... | attached to wall / embedded in wall | supported by floor | 大型家具不可能挂在墙上  |
-| 墙面装饰必须挂墙   | picture, painting, mirror, clock, poster, curtain...                               | supported by floor                  | attached to wall   | 画/镜子等不可能放在地上 |
-| 墙面嵌入物必须嵌墙 | window, door, outlet, vent, socket...                                              | supported by floor                  | embedded in wall   | 门/窗等不可能放在地上   |
-| 无效关系兜底       | 任何物体                                                                           | 非法关系字符串                      | supported by floor | 安全默认值              |
-| 缺失物体兜底       | 该帧可见但VLM未输出的物体                                                          | 无                                  | supported by floor | 确保该帧完整性          |
+| 规则 | 物体类别 | VLM错误 | 纠正为 |
+|------|---------|---------|--------|
+| 家具必须在地面 | cabinet, table, chair, sofa, bed, shelf, refrigerator, plant, box, carpet... | attached/embedded in wall | supported by floor |
+| 墙面装饰必须挂墙 | picture, painting, mirror, clock, poster, curtain... | supported by floor | attached to wall |
+| 墙面嵌入物必须嵌墙 | window, door, outlet, vent, socket... | supported by floor | embedded in wall |
+| 无效关系 | 任何物体 | 非法字符串 | supported by floor |
+| 缺失物体兜底 | 该帧可见但VLM未输出 | 无 | supported by floor |
 
-##### 7.6 汇总结果: SAM预判断 + VLM投票
-
-最终结果由两部分组成：
+##### 7.6 汇总结果
 
 ```
 对每个物体:
-  ├─ SAM预判断为floor → 直接 "supported by floor"（标记🏠）
-  ├─ 有VLM投票 → 取多数票（标记📋）
-  └─ 无SAM判断也无VLM投票 → 兜底 "supported by floor"（标记⚠️）
+  ├─ SAM预判断为floor → "supported by floor" (🏠)
+  ├─ 有VLM投票 → 取多数票 (📋)
+  └─ 无SAM也无VLM → 兜底 "supported by floor" (⚠️)
 ```
-
-**示例输出**:
-
-```
-📊 7.4 汇总结果:
-🏠 chair: supported by floor (SAM预判断, 最大重叠率: 85.2%)
-🏠 table: supported by floor (SAM预判断, 最大重叠率: 72.1%)
-📋 cup: supported by other objects (VLM投票: {'supported by other objects': 2, 'supported by floor': 1})
-📋 clock: attached to wall (VLM投票: {'attached to wall': 2})
-```
-
-##### 7.7 最终输出过滤
-
-在生成最终结果时，再次过滤掉 floor/wall/ceiling 等场景结构物体，确保它们不会出现在输出JSON中。
 
 ---
 
 ### Step 8: 保存场景JSON
 
-- 输入: 最终关系判断结果（已过滤floor/wall）
-- 输出: JSON文件
-- 格式: `{"物体名": "空间关系", ...}`，按名称排序
+- 输出格式: `{"物体名": "空间关系", ...}`，按名称排序
+- 不包含 floor/wall/ceiling 等场景结构
+
+### Step 9: 保存关键帧
+
+- 输出目录: `assets/key_frames/<视频名>/`
+- 文件命名: `frame_vid{vid_idx}.jpg`
+- 元数据: `keyframes_metadata.json`（包含关键帧索引、可见性映射、场景物体）
 
 ---
 
 ## 输出格式示例
-
-### `beizi_scene.json` (参考)
 
 ```json
 {
@@ -541,48 +502,33 @@ for vid_idx, frame_path in frame_paths_with_indices:
 }
 ```
 
-### JSON结构说明
-
-- **键**: 物体类别名（标准化后，不含floor/wall/ceiling等场景结构）
-- **值**: 4种空间关系之一
-- **判断来源**:
-  - SAM预判断: 物体bbox底部与floor mask重叠>=30%
-  - VLM投票: 多帧VLM推理 + 后处理纠错 + 多数票
-  - 兜底默认: 无SAM判断也无VLM投票时
-
 ---
 
 ## 关键设计决策
 
-### 为什么用 SAM floor mask 做预判断，而不是纯VLM？
+### 为什么用 SAM floor mask 做预判断而非纯VLM？
 
-1. **几何方法更可靠**: VLM可能因视角问题误判（如俯视时把桌子判为"attached to wall"），但SAM的floor mask是几何分割，不受视角影响
-2. **重叠检测可量化**: 30%的重叠阈值是可调节的，便于针对不同场景优化
-3. **减少VLM工作量**: SAM预判断的物体不需要VLM推理，节省计算资源
-4. **SAM和VLM互补**: SAM擅长判断"是否在地板上"（几何），VLM擅长判断"是否在墙上/其他物体上"（语义）
+1. **几何方法更可靠**: VLM可能因视角误判（俯视时把桌子判为"attached to wall"），SAM的floor mask是几何分割，不受视角影响
+2. **可量化**: 30%重叠阈值可调节，便于针对不同场景优化
+3. **减少VLM工作量**: SAM预判断的物体不需要VLM推理
+4. **SAM和VLM互补**: SAM擅长"是否在地板上"（几何），VLM擅长"是否在墙上/其他物体上"（语义）
 
 ### 为什么需要 Per-frame 可见性过滤？
 
-1. **物体不是每帧都出现**: 一个物体可能只在3个关键帧中的2个出现
-2. **不可见帧不应产生投票**: 如果物体在某帧不可见，VLM对该物体的判断是不可靠的
-3. **避免默认floor污染**: 旧逻辑中，不可见物体会被默认为"supported by floor"，导致投票偏差
-4. **Step 3已提供可见性信息**: 检测结果天然包含per-frame物体列表，直接利用即可
+1. 物体不是每帧都出现，不可见帧的VLM判断不可靠
+2. 旧逻辑中不可见物体默认"supported by floor"，导致投票偏差
+3. Step 3 的 `all_detections` 天然包含per-frame物体列表
 
 ### 为什么 floor/wall 不参与 VLM 关系判断？
 
-1. **floor 是场景结构，不是物体**: floor 的"关系"是自指的（floor supported by floor？），没有意义
-2. **同义词合并保证唯一性**: 通过 `SYNONYM_MAP`，ground/flooring/carpet/rug 全部映射为 "floor"，Step 5 去重后只有一个 "floor"
-3. **floor/wall 作为场景上下文**: 通过 `has_floor`/`has_wall` 标志传递给VLM，帮助VLM判断其他物体的关系
-4. **避免干扰VLM判断**: 如果把 floor 放在物体列表中，VLM可能浪费判断能力在无意义的 floor 关系上
+1. floor是场景结构，不是物体，其"关系"是自指的
+2. 同义词合并保证floor唯一（ground/flooring/carpet/rug → floor）
+3. floor/wall作为场景上下文（`has_floor`/`has_wall`）帮助VLM判断其他物体
 
-### 为什么使用多帧投票？
+### 为什么 Step 5.5 在 Step 6 之后执行？
 
-- 单帧VLM判断可能因视角问题出错（如俯视时误判家具"attached to wall"）
-- 多帧从不同角度观察，投票可以消除偶然错误
-- 后处理纠错 + 多帧投票双重保障
+Step 5.5 需要 SAM 的 `keyframe_floor_masks` 来排除 floor 区域的3D点。如果不排除floor点，DBSCAN会把大片地板聚成一个大聚类，浪费VLM识别次数。
 
-### 为什么需要物理常识后处理？
+### 为什么 Step 5.5 用动态置信度阈值？
 
-- VLM有时会犯违反物理常识的错误（如判断柜子"attached to wall"）
-- 后处理规则基于物体类别的物理属性进行确定性纠错
-- 纠错在投票之前执行，确保每帧的投票都是物理合理的
+不同视频的VGGT置信度分布差异很大。固定阈值（如1.5）在某些场景可能过滤掉太多点（高质量重建但整体置信度偏低），在其他场景可能保留太多噪声。50%分位数自适应地选择"上半部分"高质量点。

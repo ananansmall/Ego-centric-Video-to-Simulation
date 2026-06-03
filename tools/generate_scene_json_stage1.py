@@ -19,6 +19,7 @@ ReplicateAnyScene Stage 2: VGGT引导的智能物体发现与3D去重
 """
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -558,13 +559,42 @@ class CLIPSemanticMatcher:
         返回:
             相似度分数 [0, 1]
         """
-        inputs = self.clip_processor(images=[image1, image2], return_tensors="pt", padding=True).to(self.device)
-        with torch.no_grad():
-            outputs = self.clip_model.get_image_features(**inputs)
-            features = self._extract_features(outputs)
-        features_norm = features / features.norm(dim=1, keepdim=True)
-        similarity = (features_norm[0] @ features_norm[1].T).item()
-        return max(0.0, min(1.0, similarity))
+        try:
+            inputs = self.clip_processor(
+                images=[image1, image2],
+                return_tensors="pt",
+                padding=True
+            ).to(self.device)
+            pixel_values = inputs.get("pixel_values")
+            if pixel_values is None:
+                return 0.0
+
+            with torch.no_grad():
+                image_out = self.clip_model.get_image_features(pixel_values=pixel_values)
+
+            if isinstance(image_out, torch.Tensor):
+                image_features = image_out
+            elif hasattr(image_out, 'pooler_output'):
+                image_features = image_out.pooler_output
+            else:
+                return 0.0
+
+            if image_features is None or image_features.shape[0] != 2:
+                return 0.0
+
+            norms = image_features.norm(dim=1, keepdim=True)
+            if (norms < 1e-8).any():
+                return 0.0
+
+            image_features = image_features / norms
+            similarity = torch.dot(image_features[0], image_features[1]).item()
+
+            if math.isnan(similarity) or math.isinf(similarity):
+                return 0.0
+
+            return max(0.0, min(1.0, similarity))
+        except Exception:
+            return 0.0
 
     def compute_text_similarity(self, text1, text2):
         """
@@ -575,13 +605,45 @@ class CLIPSemanticMatcher:
         返回:
             相似度分数 [0, 1]
         """
-        inputs = self.clip_processor(text=[text1, text2], return_tensors="pt", padding=True).to(self.device)
-        with torch.no_grad():
-            outputs = self.clip_model.get_text_features(**inputs)
-            features = self._extract_features(outputs)
-        features_norm = features / features.norm(dim=1, keepdim=True)
-        similarity = (features_norm[0] @ features_norm[1].T).item()
-        return max(0.0, min(1.0, similarity))
+        try:
+            tokenizer = self.clip_processor.tokenizer
+            tokens = tokenizer(
+                [text1, text2],
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=77
+            ).to(self.device)
+
+            with torch.no_grad():
+                text_out = self.clip_model.get_text_features(
+                    input_ids=tokens["input_ids"],
+                    attention_mask=tokens["attention_mask"]
+                )
+
+            if isinstance(text_out, torch.Tensor):
+                text_features = text_out
+            elif hasattr(text_out, 'pooler_output'):
+                text_features = text_out.pooler_output
+            else:
+                return 0.0
+
+            if text_features is None or text_features.shape[0] != 2:
+                return 0.0
+
+            norms = text_features.norm(dim=1, keepdim=True)
+            if (norms < 1e-8).any():
+                return 0.0
+
+            text_features = text_features / norms
+            similarity = torch.dot(text_features[0], text_features[1]).item()
+
+            if math.isnan(similarity) or math.isinf(similarity):
+                return 0.0
+
+            return max(0.0, min(1.0, similarity))
+        except Exception:
+            return 0.0
 
 
 # ============================================================
@@ -869,9 +931,10 @@ def detect_objects_in_frames(frame_paths_with_indices, model, processor):
                     print(f"   📝 VLM完整输出:\n{output_text}", flush=True)
                     continue
 
-            objects = result.get("objects", result.get("detections", []))
             if isinstance(result, list):
                 objects = result
+            else:
+                objects = result.get("objects", result.get("detections", []))
 
             img_w, img_h = image.size
             for obj in objects:
@@ -983,24 +1046,68 @@ def build_object_instances(all_detections, vggt_results):
 # Step 5: 名称 + 3D位置联合去重
 # ============================================================
 
-def deduplicate_objects(object_instances, centroid_dist_thre=CENTROID_DIST_THRESHOLD):
+CLIP_MERGE_THRESHOLD = 0.90
+
+
+def deduplicate_objects(object_instances, centroid_dist_thre=CENTROID_DIST_THRESHOLD, clip_matcher=None):
     """
-    基于名称匹配的去重：同名物体直接合并为一个
+    基于CLIP语义匹配 + SYNONYM_MAP的联合去重
+
+    去重策略（优先级从高到低）:
+      1. SYNONYM_MAP精确匹配: "mug"→"cup", "sofa"→"couch" 等
+      2. CLIP语义相似度: 文本相似度 >= 0.85 视为同义 (如 "trash can" ≈ "garbage can")
+      3. 名称标准化: 去复数、小写等
 
     参数:
         object_instances: build_object_instances的输出
         centroid_dist_thre: 3D质心距离阈值（米），仅用于非同名物体
+        clip_matcher: CLIPSemanticMatcher实例（可选，无则仅用SYNONYM_MAP）
     返回:
         去重后的唯一物体列表
     """
     print(f"\n{'='*70}", flush=True)
-    print(f"🔗 Step 5: 名称去重（同名合并）", flush=True)
+    print(f"🔗 Step 5: 语义去重（SYNONYM_MAP + CLIP）", flush=True)
     print(f"{'='*70}\n", flush=True)
 
     name_groups = defaultdict(list)
     for inst in object_instances:
         std_name = merge_synonyms(inst["name"])
         name_groups[std_name].append(inst)
+
+    if clip_matcher and len(name_groups) > 1:
+        print(f"   🧠 CLIP语义匹配中 ({len(name_groups)} 个候选名称)...", flush=True)
+        group_names = list(name_groups.keys())
+        merged_pairs = []
+
+        for i in range(len(group_names)):
+            for j in range(i + 1, len(group_names)):
+                name_i = group_names[i]
+                name_j = group_names[j]
+                if name_i in FILTER_CATEGORIES or name_j in FILTER_CATEGORIES:
+                    continue
+                try:
+                    sim = clip_matcher.compute_text_similarity(
+                        name_i.replace("_", " "), name_j.replace("_", " ")
+                    )
+                    if sim >= CLIP_MERGE_THRESHOLD:
+                        merged_pairs.append((name_i, name_j, sim))
+                        print(f"   🔗 CLIP合并: '{name_i}' ≈ '{name_j}' (相似度={sim:.3f})", flush=True)
+                except Exception:
+                    pass
+
+        for name_i, name_j, sim in merged_pairs:
+            if name_i in name_groups and name_j in name_groups:
+                if name_i in SYNONYM_MAP.values() or name_i in SYNONYM_MAP:
+                    keep, remove = name_i, name_j
+                elif len(name_groups[name_i]) >= len(name_groups[name_j]):
+                    keep, remove = name_i, name_j
+                else:
+                    keep, remove = name_j, name_i
+                name_groups[keep].extend(name_groups.pop(remove))
+                print(f"   🔄 '{remove}' → '{keep}' (合并 {len(name_groups[keep])} 个实例)", flush=True)
+    else:
+        if not clip_matcher:
+            print(f"   ⚠️  CLIP不可用，仅使用SYNONYM_MAP去重", flush=True)
 
     unique_objects = []
     for std_name, instances in name_groups.items():
@@ -1016,7 +1123,7 @@ def deduplicate_objects(object_instances, centroid_dist_thre=CENTROID_DIST_THRES
 
         if len(instances) > 1:
             frame_indices = [inst['frame_idx'] for inst in instances]
-            print(f"   🔄 同名合并: '{std_name}' {len(instances)}个实例 → 1个 (帧: {frame_indices})", flush=True)
+            print(f"   🔄 合并: '{std_name}' {len(instances)}个实例 → 1个 (帧: {frame_indices})", flush=True)
 
     print(f"\n📊 去重后剩余 {len(unique_objects)} 个唯一物体类别\n", flush=True)
     return unique_objects
@@ -1905,6 +2012,7 @@ def main():
     parser = argparse.ArgumentParser(description='ReplicateAnyScene Stage 2')
     parser.add_argument('--input_video', type=str, required=True, help='输入视频路径')
     parser.add_argument('--output_json', type=str, default=None, help='输出 JSON 路径')
+    parser.add_argument('--output_dir', type=str, default=None, help='输出目录 (保存关键帧和元数据, 默认与output_json同目录)')
     parser.add_argument('--vlm_checkpoint', type=str, default=None, help='VLM 模型路径')
     parser.add_argument('--max_frames', type=int, default=10, help='VGGT采样最大帧数')
     parser.add_argument('--temp_dir', type=str, default='./temp_frames_stage2', help='临时帧目录')
@@ -1921,6 +2029,9 @@ def main():
     if args.output_json is None:
         video_stem = Path(args.input_video).stem
         args.output_json = f"./assets/json_configs/scene_{video_stem}_stage2.json"
+
+    if args.output_dir is None:
+        args.output_dir = os.path.dirname(os.path.abspath(args.output_json))
 
     if args.vlm_checkpoint is None:
         default_model = "/mnt/data/lza/models/Qwen3.5-9B"
@@ -1944,6 +2055,7 @@ def main():
     print("=" * 70, flush=True)
     print(f"📥 输入视频: {args.input_video}")
     print(f"📤 输出 JSON: {args.output_json}")
+    print(f"📂 输出目录: {args.output_dir}")
     print(f"🤖 VLM模型: {args.vlm_checkpoint}")
     print(f"🖼️  最大帧数: {args.max_frames}")
     print("=" * 70 + "\n", flush=True)
@@ -2001,10 +2113,22 @@ def main():
             print("❌ 没有有效的物体实例", flush=True)
             return
 
-        # Step 5: 去重
+        # Step 5: 去重（SYNONYM_MAP + CLIP语义匹配）
+        clip_matcher = None
+        if CLIP_AVAILABLE:
+            try:
+                clip_matcher = CLIPSemanticMatcher(device=device)
+            except Exception as e:
+                print(f"   ⚠️  CLIP加载失败: {e}，仅使用SYNONYM_MAP去重", flush=True)
+
         unique_objects = deduplicate_objects(
-            object_instances, centroid_dist_thre=args.centroid_dist_thre
+            object_instances, centroid_dist_thre=args.centroid_dist_thre,
+            clip_matcher=clip_matcher
         )
+
+        if clip_matcher is not None:
+            del clip_matcher
+            torch.cuda.empty_cache()
 
         if not unique_objects:
             print("❌ 去重后没有剩余物体", flush=True)
@@ -2051,6 +2175,53 @@ def main():
 
         # Step 8: 保存JSON
         generate_scene_json(final_objects, args.output_json)
+
+        # Step 9: 保存贪心采样关键帧 + 每帧可见物体映射到输出目录
+        video_stem = Path(args.input_video).stem
+        keyframes_out_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", "assets", "key_frames", video_stem
+        )
+        keyframes_out_dir = os.path.normpath(keyframes_out_dir)
+        os.makedirs(keyframes_out_dir, exist_ok=True)
+
+        import shutil
+        saved_keyframes = []
+        for vid_idx, frame_path in frame_paths_with_indices:
+            dst_name = f"frame_vid{vid_idx}.jpg"
+            dst_path = os.path.join(keyframes_out_dir, dst_name)
+            shutil.copy2(frame_path, dst_path)
+            saved_keyframes.append({"vid_idx": vid_idx, "path": dst_name})
+
+        frame_visibility = {}
+        for detection in all_detections:
+            fidx = detection["frame_idx"]
+            visible_names = list(set(
+                merge_synonyms(obj["name"])
+                for obj in detection["objects"]
+                if "name" in obj and merge_synonyms(obj["name"]) not in FILTER_CATEGORIES
+            ))
+            frame_visibility[str(fidx)] = visible_names
+
+        metadata = {
+            "keyframe_indices": keyframe_indices,
+            "keyframes": saved_keyframes,
+            "frame_visibility": frame_visibility,
+            "scene_objects": {name: rel for name, rel in final_objects.items()},
+        }
+        metadata_path = os.path.join(keyframes_out_dir, "keyframes_metadata.json")
+        with open(metadata_path, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+        print(f"\n{'='*70}", flush=True)
+        print(f"💾 Step 9: 保存贪心采样关键帧", flush=True)
+        print(f"{'='*70}", flush=True)
+        print(f"   📁 关键帧目录: {keyframes_out_dir}", flush=True)
+        print(f"   📋 元数据: {metadata_path}", flush=True)
+        print(f"   🖼️  保存 {len(saved_keyframes)} 个关键帧", flush=True)
+        print(f"   👁️  可见性映射: {len(frame_visibility)} 帧", flush=True)
+        for fidx_str, names in sorted(frame_visibility.items(), key=lambda x: int(x[0])):
+            print(f"      帧#{fidx_str}: {names}", flush=True)
 
     except KeyboardInterrupt:
         print("\n⚠️  用户中断", flush=True)
