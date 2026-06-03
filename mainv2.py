@@ -28,10 +28,12 @@ ReplicateAnyScene V2 — 完整自动化流水线
     5.1: 细化 "supported by other objects" 关系 (VLM判断具体支撑物)
     5.2: 物体间支撑关系空间位置精修 (纯几何计算)
 
-GLB 文件说明:
-  final_scene_base.glb    = 基础精修后固定起点 (供 run_post_pipeline.py 使用, 不再更改)
-  final_scene.glb         = 最终场景 (始终为最新结果, 不启用stage4/5时等同base)
-  all_instances.pkl       = 基础精修后的实例数据 (供 run_post_pipeline.py 独立调用stage4/5)
+GLB 文件说明 (按启用的 Stage 决定文件名):
+  final_scene.glb          = Stage3 基础精修产物 (固定起点, 不再更改)
+  final_scene_stage4.glb   = Stage4 产物 (视觉-空间对齐后)
+  final_scene_stage5.glb   = 仅 Stage5 产物 (语义精修后)
+  final_scene_stage4_5.glb = Stage4+5 产物 (全部后处理后)
+  all_instances.pkl        = 基础精修后的实例数据 (供 run_post_pipeline.py 独立调用stage4/5)
 
 使用方式:
   ────────────────────────────────────────────────────────────
@@ -47,6 +49,7 @@ GLB 文件说明:
   --vlm_checkpoint    VLM模型路径 (默认自动查找)
   --enable_stage4     启用Stage 4视觉-空间对齐
   --enable_stage5     启用Stage 5高级语义精修 (5.1+5.2)
+  --stage5_method     Stage5.1关系推断方式: scene_graph(默认) | per_object
   --stage4_iterations Stage4 ICP迭代次数 (默认8)
   --stage4_temporal_radius Stage4时序邻域半径 (默认5)
   --stage4_use_mast3r Stage4使用MASt3R匹配
@@ -63,6 +66,9 @@ GLB 文件说明:
 
   # VGGT4D + 全部高级阶段
   python mainv2.py --input_video ./232.mp4 --vggt_model vggt4d --enable_stage4 --enable_stage5
+
+  # VGGT4D + Stage5 使用逐物体推断 (旧方式)
+  python mainv2.py --input_video ./232.mp4 --vggt_model vggt4d --enable_stage5 --stage5_method per_object
 
   # 手动指定场景JSON (跳过Stage1自动发现)
   python mainv2.py --input_video ./hallway.mp4 --category_path ./hallway.json
@@ -194,7 +200,7 @@ def _resolve_vlm_checkpoint(checkpoint_arg):
     return None
 
 
-def run_stage1(input_video, output_path, vlm_checkpoint, max_frames_stage1=10):
+def run_stage1(input_video, output_path, vlm_checkpoint, max_frames_stage1=10, vggt_max_frames=160):
     """
     Stage 1: VGGT引导的智能物体发现 → 场景JSON
 
@@ -233,6 +239,7 @@ def run_stage1(input_video, output_path, vlm_checkpoint, max_frames_stage1=10):
         "--output_dir", keyframes_dir,
         "--vlm_checkpoint", vlm_checkpoint,
         "--max_frames", str(max_frames_stage1),
+        "--vggt_max_frames", str(vggt_max_frames),
     ]
 
     print(f"   命令: {' '.join(cmd)}", flush=True)
@@ -619,42 +626,63 @@ def run_stage4(output_path, vggt_prediction_results, all_instances, args,
 
 def run_stage5(output_path, categories_and_relations, all_instances,
                vggt_prediction_results, all_optimal_frame_ids,
-               wall_masks, vlm_checkpoint, stage1_json):
+               wall_masks, vlm_checkpoint, stage1_json,
+               deduplicated_all_masks=None, stage5_method="scene_graph"):
     """
     Stage 5: 高级语义精修 (5.1 + 5.2, 需 --enable_stage5 启用)
 
     注意: 5.0 基础精修 (floor/wall/embedded) 已移至 main() 中始终执行，
     与 main.py 行为一致。此函数只处理 5.1 和 5.2。
+
+    5.1 关系推断有两种方式 (--stage5_method):
+      scene_graph: SimRecon风格, 在ID标注图上一次性推断所有关系 (默认, 推荐)
+      per_object:  逐物体推断, 只细化 "supported by other objects" (旧方式)
+
+    5.2 几何精修始终使用 sp_refinement.py 的方式。
     """
     print("\n" + "=" * 70, flush=True)
-    print("🚀 Stage 5: 高级语义精修 (5.1 + 5.2)", flush=True)
+    print(f"🚀 Stage 5: 高级语义精修 (5.1 + 5.2) [method={stage5_method}]", flush=True)
     print("=" * 70, flush=True)
 
     walls_info = get_walls_info(vggt_prediction_results['world_points'], wall_masks)
     refined_relations = dict(categories_and_relations)
 
-    has_other_objects = any(
-        rel == "supported by other objects"
-        for rel in categories_and_relations.values()
-    )
-
-    if has_other_objects:
-        print("\n   📍 5.1: 细化 'supported by other objects' 关系", flush=True)
-        scene_id = os.path.splitext(os.path.basename(stage1_json))[0]
-        refined_json = os.path.join(output_path, f"{scene_id}_refined.json")
-
-        from tools.refine_other_objects_relations import refine_other_objects_relations
-        refined_relations = refine_other_objects_relations(
-            stage1_json_path=stage1_json,
-            output_json_path=refined_json,
+    # ── 5.1: 关系推断 ──
+    if stage5_method == "scene_graph":
+        print("\n   📍 5.1: 场景图关系推断 (SimRecon风格)", flush=True)
+        from tools.infer_relations_scene_graph import infer_relations_scene_graph
+        refined_relations = infer_relations_scene_graph(
             scene_dir=output_path,
             vlm_checkpoint=vlm_checkpoint,
-            optimal_frames_dir=os.path.join(output_path, 'optimal_frames'),
-            keyframes_dir=os.path.join(output_path, 'keyframes'),
+            categories_and_relations=categories_and_relations,
+            instance_masks=deduplicated_all_masks,
+            colors=vggt_prediction_results['colors'],
+            output_dir=output_path,
         )
     else:
-        print("\n   📍 5.1: 无 'supported by other objects' 关系，跳过细化", flush=True)
+        has_other_objects = any(
+            rel == "supported by other objects"
+            for rel in categories_and_relations.values()
+        )
 
+        if has_other_objects:
+            print("\n   📍 5.1: 细化 'supported by other objects' 关系 (逐物体推断)", flush=True)
+            scene_id = os.path.splitext(os.path.basename(stage1_json))[0]
+            refined_json = os.path.join(output_path, f"{scene_id}_refined.json")
+
+            from tools.refine_other_objects_relations import refine_other_objects_relations
+            refined_relations = refine_other_objects_relations(
+                stage1_json_path=stage1_json,
+                output_json_path=refined_json,
+                scene_dir=output_path,
+                vlm_checkpoint=vlm_checkpoint,
+                optimal_frames_dir=os.path.join(output_path, 'optimal_frames'),
+                keyframes_dir=os.path.join(output_path, 'keyframes'),
+            )
+        else:
+            print("\n   📍 5.1: 无 'supported by other objects' 关系，跳过细化", flush=True)
+
+    # ── 5.2: 几何精修 (始终使用 sp_refinement.py 方式) ──
     has_inter_object = any(
         rel.startswith("supported by ") and "floor" not in rel and "other objects" not in rel
         for rel in refined_relations.values()
@@ -780,6 +808,7 @@ def main(args):
     stage1_json, categories_and_relations = run_stage1(
         args.input_video, args.output_path, vlm_checkpoint,
         max_frames_stage1=args.max_frames_stage1,
+        vggt_max_frames=args.max_frames,
     )
 
     # ── Stage 2: VGGT 3D重建 + SAM3空间去重 ──
@@ -814,8 +843,8 @@ def main(args):
                 continue
             category_instances[instance_id] = instance_info
 
-    # 保存基础精修后的结果 (供 run_post_pipeline.py 作为固定起点)
-    save_final_glb(all_instances, args.output_path, "final_scene_base.glb")
+    # 保存基础精修后的结果 (Stage3产物, 供 run_post_pipeline.py 作为固定起点)
+    save_final_glb(all_instances, args.output_path, "final_scene.glb")
 
     import pickle
     pkl_path = os.path.join(args.output_path, "all_instances.pkl")
@@ -837,59 +866,46 @@ def main(args):
         )
         from tools.refine_inter_object_placement import resolve_penetrations
         all_instances = resolve_penetrations(all_instances, categories_and_relations, verbose=True)
+        save_final_glb(all_instances, args.output_path, "final_scene_stage4.glb")
+        import pickle as _pkl
+        s4_pkl_path = os.path.join(args.output_path, "all_instances_stage4.pkl")
+        with open(s4_pkl_path, 'wb') as f:
+            _pkl.dump(all_instances, f)
+        print(f"💾 all_instances_stage4.pkl 已保存", flush=True)
     else:
         print("\n⏭️  Stage 4 已跳过 (使用 --enable_stage4 启用)", flush=True)
 
     # ── Stage 5: 高级语义精修 (可选，默认关闭) ──
     refined_relations = dict(categories_and_relations)
     if args.enable_stage5:
-        # 5.1: 细化 "supported by other objects" 关系
-        has_other_objects = any(
-            rel == "supported by other objects"
-            for rel in categories_and_relations.values()
+        all_instances, refined_relations = run_stage5(
+            args.output_path, categories_and_relations, all_instances,
+            vggt_prediction_results, all_optimal_frame_ids,
+            wall_masks, vlm_checkpoint, stage1_json,
+            deduplicated_all_masks=deduplicated_all_masks,
+            stage5_method=getattr(args, 'stage5_method', 'scene_graph'),
         )
-        if has_other_objects:
-            print("\n   📍 5.1: 细化 'supported by other objects' 关系", flush=True)
-            scene_id = os.path.splitext(os.path.basename(stage1_json))[0]
-            refined_json = os.path.join(args.output_path, f"{scene_id}_refined.json")
 
-            from tools.refine_other_objects_relations import refine_other_objects_relations
-            refined_relations = refine_other_objects_relations(
-                stage1_json_path=stage1_json,
-                output_json_path=refined_json,
-                scene_dir=args.output_path,
-                vlm_checkpoint=vlm_checkpoint,
-                optimal_frames_dir=os.path.join(args.output_path, 'optimal_frames'),
-                keyframes_dir=os.path.join(args.output_path, 'keyframes'),
-            )
+        if args.enable_stage4:
+            save_final_glb(all_instances, args.output_path, "final_scene_stage4_5.glb")
         else:
-            print("\n   📍 5.1: 无 'supported by other objects' 关系，跳过细化", flush=True)
-
-        # 5.2: 物体间支撑关系空间位置精修
-        has_inter_object = any(
-            rel.startswith("supported by ") and "floor" not in rel and "other objects" not in rel
-            for rel in refined_relations.values()
-        )
-        if has_inter_object:
-            print("\n   📍 5.2: 物体间支撑关系空间位置精修", flush=True)
-            from tools.refine_inter_object_placement import refine_inter_object_relations
-            all_instances = refine_inter_object_relations(
-                all_instances, refined_relations,
-                walls_info=walls_info, verbose=True,
-                vlm_checkpoint=vlm_checkpoint,
-                scene_dir=args.output_path,
-            )
-        else:
-            print("\n   📍 5.2: 无物体间支撑关系，跳过精修", flush=True)
+            save_final_glb(all_instances, args.output_path, "final_scene_stage5.glb")
     else:
         print("\n⏭️  Stage 5 高级精修已跳过 (使用 --enable_stage5 启用)", flush=True)
-
-    # ── 保存最终结果 ──
-    glb_path = save_final_glb(all_instances, args.output_path)
 
     # 保存最终关系JSON
     with open(os.path.join(args.output_path, "final_relations.json"), 'w') as f:
         json.dump(refined_relations, f, indent=2, ensure_ascii=False)
+
+    # 确定最终GLB路径用于日志输出
+    if args.enable_stage4 and args.enable_stage5:
+        glb_path = os.path.join(args.output_path, "final_scene_stage4_5.glb")
+    elif args.enable_stage4:
+        glb_path = os.path.join(args.output_path, "final_scene_stage4.glb")
+    elif args.enable_stage5:
+        glb_path = os.path.join(args.output_path, "final_scene_stage5.glb")
+    else:
+        glb_path = os.path.join(args.output_path, "final_scene.glb")
 
     total_time = time.time() - total_start
     print("\n" + "=" * 70, flush=True)
@@ -924,6 +940,9 @@ if __name__ == "__main__":
                         help="启用Stage 4视觉-空间对齐 (默认关闭)")
     parser.add_argument("--enable_stage5", action="store_true",
                         help="启用Stage 5语义感知场景精修 (默认关闭)")
+    parser.add_argument("--stage5_method", type=str, default="scene_graph",
+                        choices=["scene_graph", "per_object"],
+                        help="Stage5.1关系推断方式: scene_graph(SimRecon风格,默认) | per_object(逐物体推断)")
     parser.add_argument("--stage4_iterations", type=int, default=8,
                         help="Stage4 ICP迭代次数 (默认8)")
     parser.add_argument("--stage4_temporal_radius", type=int, default=5,

@@ -16,6 +16,7 @@
 """
 
 import argparse
+import importlib.util
 import json
 import os
 import sys
@@ -26,13 +27,28 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..
 HAWOR_ROOT = os.path.join(PROJECT_ROOT, "HaWoR")
 RAS_ROOT = os.path.join(PROJECT_ROOT, "ReplicateAnyScene")
 
-for p in [HAWOR_ROOT, RAS_ROOT]:
-    if p not in sys.path:
-        sys.path.insert(0, p)
+_DIR = os.path.dirname(os.path.abspath(__file__))
 
-from point_tracker import run_point_tracking
-from grasp_controller import run_grasp_controller
-from trajectory_refiner import run_trajectory_refiner
+
+def _load_module(name, filename):
+    path = os.path.join(_DIR, filename)
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_mod_ga = _load_module("glb_video_align", "01_glb_video_align.py")
+_mod_pt = _load_module("point_tracker", "02_point_tracker.py")
+_mod_gc = _load_module("grasp_controller", "03_grasp_controller.py")
+_mod_tr = _load_module("trajectory_refiner", "04_trajectory_refiner.py")
+_mod_cl = _load_module("closed_loop_verifier", "05_closed_loop_verifier.py")
+
+align_glb_to_video = _mod_ga.align_glb_to_video
+run_point_tracking = _mod_pt.run_point_tracking
+run_grasp_controller = _mod_gc.run_grasp_controller
+run_trajectory_refiner = _mod_tr.run_trajectory_refiner
+run_closed_loop_verification = _mod_cl.run_closed_loop_verification
 
 
 def resolve_video_name(video_path):
@@ -71,15 +87,6 @@ def load_hawor_results(npz_path):
 
 
 def find_hawor_hand_masks(video_name, base_dir):
-    """查找 HaWoR 手部检测 mask (model_masks.npy)
-
-    搜索路径:
-      1. {base_dir}/{video_name}/model_masks.npy
-      2. HaWoR/example/{video_name}/tracks_*/model_masks.npy
-
-    Returns:
-        str or None: mask 文件路径
-    """
     import glob
 
     candidates = [
@@ -97,24 +104,6 @@ def find_hawor_hand_masks(video_name, base_dir):
 
 
 def generate_mano_vertices(pred_trans, pred_rot, pred_hand_pose, pred_betas):
-    """从 MANO 参数生成手部顶点和指尖位置
-
-    注意: 这里只是 HaWoR 输出的正运动学, 不重新估计手部
-
-    Args:
-        pred_trans: (2, T, 3) 双手平移
-        pred_rot: (2, T, 3) 双手旋转 (axis-angle)
-        pred_hand_pose: (2, T, 45) 双手关节旋转
-        pred_betas: (2, T, 10) 双手 shape
-
-    Returns:
-        dict: {
-            hand_vertices_left: (T, 778, 3),
-            hand_vertices_right: (T, 778, 3),
-            fingertips_3d_left: (T, 5, 3),
-            fingertips_3d_right: (T, 5, 3),
-        }
-    """
     FINGERTIP_INDICES = [744, 320, 443, 554, 671]
 
     try:
@@ -150,7 +139,7 @@ def generate_mano_vertices(pred_trans, pred_rot, pred_hand_pose, pred_betas):
             "fingertips_3d_right": fingertips_3d_right,
         }
     except Exception as e:
-        print(f"[run_precise_tracking] WARNING: Failed to generate MANO vertices: {e}")
+        print(f"[run_pipeline] WARNING: Failed to generate MANO vertices: {e}")
         T = pred_trans.shape[1]
         return {
             "hand_vertices_left": None,
@@ -191,7 +180,7 @@ def load_object_masks(mask_path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Precise Object Tracking Pipeline (V-Dreamer approach)\n"
+        description="Precise Object Tracking Pipeline\n"
                     "VGGT4D TrackHead + Motion Coupling + Closed-Loop Verification"
     )
     parser.add_argument("--video", type=str, required=True,
@@ -231,10 +220,43 @@ def main():
     os.makedirs(args.output, exist_ok=True)
 
     print("=" * 70)
-    print(f"  Precise Object Tracking Pipeline (V-Dreamer Approach)")
+    print(f"  Precise Object Tracking Pipeline")
     print(f"  Video: {args.video}")
     print(f"  Output: {args.output}")
     print("=" * 70)
+
+    # ── Step 0: GLB-视频对齐验证 ──
+    print("\n" + "=" * 70)
+    print("Step 0: GLB-Video Alignment Verification")
+    print("=" * 70)
+
+    glb_path = os.path.join(args.base_dir, video_name, "final_scene.glb")
+    extrinsics_dir = os.path.join(args.base_dir, video_name, "extrinsics")
+    intrinsic_path = os.path.join(args.base_dir, video_name, "intrinsic.txt")
+
+    if os.path.isfile(glb_path) and os.path.isdir(extrinsics_dir):
+        print(f"  GLB: {glb_path}")
+        print(f"  Extrinsics: {extrinsics_dir}")
+
+        extrinsics = _mod_ga.load_extrinsics_from_dir(extrinsics_dir)
+        intrinsic = _mod_ga.load_intrinsic(intrinsic_path)
+
+        align_dir = os.path.join(args.output, "alignment")
+        align_result = align_glb_to_video(
+            glb_path=glb_path,
+            video_path_or_frames=args.video,
+            extrinsics=extrinsics,
+            intrinsic=intrinsic,
+            output_dir=align_dir,
+            render_edges=True,
+            save_video=True,
+            frame_indices=list(range(0, len(extrinsics), max(1, len(extrinsics) // 10))),
+        )
+        print(f"  Alignment: {align_result['n_frames']} frames rendered")
+    else:
+        print(f"  WARNING: GLB or extrinsics not found, skipping alignment")
+        print(f"    GLB: {glb_path} ({'exists' if os.path.isfile(glb_path) else 'MISSING'})")
+        print(f"    Extrinsics: {extrinsics_dir} ({'exists' if os.path.isdir(extrinsics_dir) else 'MISSING'})")
 
     # ── Step 1: VGGT4D + TrackHead 联合点追踪 ──
     print("\n" + "=" * 70)
@@ -324,8 +346,6 @@ def main():
 
         tracks_3d = track_data["tracks_3d"]
         valid_3d = track_data["valid_3d"]
-        visibility = track_data.get("visibility", None)
-        confidence = track_data.get("confidence", None)
 
         grasp_result = run_grasp_controller(
             object_tracks_3d=tracks_3d,
@@ -449,17 +469,16 @@ def main():
     print(f"  - dynamic_mask.npy    (refined dynamic mask)")
     print(f"  - precise_tracking_summary.json")
 
-    # ── Step 6: 仿真执行 (可选) ──
+    # ── Step 6: 仿真执行 + 闭环验证 (可选) ──
     if not args.skip_simulation:
         print("\n" + "=" * 70)
-        print("Step 6: Simulation Execution")
+        print("Step 6: Simulation + Closed-Loop Verification")
         print("=" * 70)
 
         try:
             from simulation.scene_builder import build_scene
             from simulation.action_player import (
                 mano_trajectory_to_ee_trajectory,
-                gripper_timeline_to_signal,
                 run_simulation,
             )
 
@@ -492,14 +511,7 @@ def main():
                     **sim_result.get("verification", {}),
                 )
 
-                # ── Step 7: 闭环验证 (可选) ──
                 if not args.skip_closed_loop:
-                    print("\n" + "=" * 70)
-                    print("Step 7: Closed-Loop Verification")
-                    print("=" * 70)
-
-                    from closed_loop_verifier import run_closed_loop_verification
-
                     all_contact_frames = []
                     for hand_label, segs in grasp_result["segments"].items():
                         for seg in segs:

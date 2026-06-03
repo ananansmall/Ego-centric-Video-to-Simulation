@@ -6,13 +6,12 @@
     → VGGT+VGGT4D (3D感知)
     → HaWoR (手部重建)
     → ReplicateAnyScene (场景重建)
-    → object_tracking (接触检测 + 物体追踪)
-    → action_semantics (动作语义化)
+    → object_tracking (运动耦合检测 + 物体追踪)
     → 本脚本 (物理仿真)
 
 输入:
   --hawor_npz       HaWoR 重建结果 (pred_trans, pred_rot)
-  --action_json     动作语义化结果 (夹爪时序)
+  --action_json     夹爪时序 (来自 grasp_controller)
   --scene_glb       静态场景 GLB
   --objects_json    物体信息 (mesh路径 + 初始位姿)
   --tracked_dir     VGGT追踪物体轨迹目录 (验证用)

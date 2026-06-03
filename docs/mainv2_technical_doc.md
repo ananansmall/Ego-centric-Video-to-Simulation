@@ -623,3 +623,683 @@ for frame_id, mask in instance_masks:
 ```
 
 **每次精修都是在T左侧乘一个变换矩阵**，即 `T_new = correction @ T_old`。这意味着精修是累积的，后一次精修在前一次精修的基础上调整。
+
+---
+
+## 六、Stage 3 完整流程与实际代码
+
+Stage 3 是从 mask 到 3D 资产的核心阶段，包含最优帧选择、3D资产生成、多票验证三个子步骤。以下为 mainv2.py 中 `run_stage3()` 的完整代码逻辑。
+
+### 6.1 Stage 3 入口 — run_stage3()
+
+**代码位置**: `mainv2.py:426-512`
+
+```python
+def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
+    # ── 3.1 计算每个实例的最优视角帧ID ──
+    all_optimal_frame_ids = {}
+    dynamic_count = 0
+    static_count = 0
+    for category, category_masks in deduplicated_all_masks.items():
+        all_optimal_frame_ids[category] = []
+        for inst_idx, instance_masks in enumerate(category_masks):
+            optimal_frame_id, is_dynamic, motion_info = get_optimal_view_frame_id(
+                vggt_prediction_results['world_points'], instance_masks
+            )
+            all_optimal_frame_ids[category].append(optimal_frame_id)
+            tag = "DYNAMIC" if is_dynamic else "STATIC"
+            if is_dynamic:
+                dynamic_count += 1
+            else:
+                static_count += 1
+            print(f"   {category}_{inst_idx}: [{tag}] median_disp={motion_info['median_disp']}m, "
+                  f"max_disp={motion_info['max_disp']}m, "
+                  f"global_disp={motion_info['global_disp']}m, "
+                  f"valid_frames={motion_info['num_valid_frames']} → frame {optimal_frame_id}")
+
+    # ── 3.2 保存最优视角帧图像 ──
+    optimal_frames_dir = os.path.join(output_path, 'optimal_frames')
+    os.makedirs(optimal_frames_dir, exist_ok=True)
+    for category, frame_ids in all_optimal_frame_ids.items():
+        for inst_idx, frame_id in enumerate(frame_ids):
+            image_rgb = vggt_prediction_results['colors'][frame_id]
+            image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+            save_name = f"{category}_inst{inst_idx}_frame{frame_id}.jpg"
+            cv2.imwrite(os.path.join(optimal_frames_dir, save_name), image_bgr)
+
+    # ── 3.3 保存实例可见性信息 ──
+    instance_visibility = {}
+    for category, category_masks in deduplicated_all_masks.items():
+        instance_visibility[category] = {}
+        for inst_idx, instance_masks in enumerate(category_masks):
+            frame_ids = sorted([im["frame_id"] for im in instance_masks])
+            instance_visibility[category][str(inst_idx)] = frame_ids
+    visibility_path = os.path.join(optimal_frames_dir, "instance_visibility.json")
+    with open(visibility_path, 'w', encoding='utf-8') as f:
+        json.dump(instance_visibility, f, indent=2, ensure_ascii=False)
+
+    # ── 3.4 在子进程中生成3D资产（避免CUDA内存冲突）──
+    all_instances = generate_3d_asset_in_subprocess(
+        deduplicated_all_masks,
+        all_optimal_frame_ids,
+        vggt_prediction_results['colors'],
+        vggt_prediction_results['world_points'],
+        vggt_prediction_results['extrinsics'],
+    )
+
+    # ── 3.5 多票验证生成的3D资产 ──
+    from tools.asset_verifier import verify_all_instances
+    all_instances = verify_all_instances(
+        all_instances,
+        all_optimal_frame_ids,
+        deduplicated_all_masks,
+        vggt_prediction_results['world_points'],
+        vggt_prediction_results['world_points_conf'],
+        min_votes=2,
+    )
+
+    return all_instances, all_optimal_frame_ids
+```
+
+### 6.2 最优帧选择 — get_optimal_view_frame_id() 实际代码
+
+**代码位置**: `src/geometry_utils.py:307-429`
+
+这是决定3D资产质量的关键函数。选错帧 → mask不完整/手部遮挡 → mesh质量差 → 位置偏移。
+
+```python
+def get_optimal_view_frame_id(world_points, instance_masks, motion_threshold=0.02):
+    # ── 第1步: 计算每帧mask区域的3D质心 ──
+    centroids = []
+    for instance_mask in instance_masks:
+        frame_id = instance_mask['frame_id']
+        mask = instance_mask['mask']
+        pointmap = world_points[frame_id]
+        valid = mask > 0
+        if not np.any(valid):
+            centroids.append((frame_id, None))
+            continue
+        pts = pointmap[valid]
+        finite = np.all(np.isfinite(pts), axis=-1)
+        if not np.any(finite):
+            centroids.append((frame_id, None))
+            continue
+        centroids.append((frame_id, np.mean(pts[finite], axis=0)))
+
+    valid_centroids = [(fid, c) for fid, c in centroids if c is not None]
+    num_valid_frames = len(valid_centroids)
+
+    # ── 第2步: 计算相邻帧质心位移 ──
+    consecutive_disps = []
+    for i in range(1, len(valid_centroids)):
+        disp = np.linalg.norm(valid_centroids[i][1] - valid_centroids[i-1][1])
+        consecutive_disps.append(disp)
+
+    median_disp = float(np.median(consecutive_disps))
+    max_disp = float(np.max(consecutive_disps))
+
+    # ── 第3步: 计算全局位移 (首20% vs 末20%的质心均值距离) ──
+    n_head = max(1, num_valid_frames // 5)
+    n_tail = max(1, num_valid_frames // 5)
+    head_mean = np.mean([c for _, c in valid_centroids[:n_head]], axis=0)
+    tail_mean = np.mean([c for _, c in valid_centroids[-n_tail:]], axis=0)
+    global_disp = float(np.linalg.norm(tail_mean - head_mean))
+
+    # ── 第4步: 动态/静态判断 ──
+    is_dynamic_consecutive = median_disp > motion_threshold   # 逐帧漂移
+    is_dynamic_global = global_disp > max(motion_threshold * 2, 0.04)  # 全局位移
+    is_dynamic = is_dynamic_consecutive or is_dynamic_global
+
+    # ── 第5步: 根据动静态选择最优帧 ──
+    if is_dynamic:
+        # 动态物体: 找运动起始帧，选运动前面积最大的帧
+        motion_onset_idx = 0
+        onset_threshold = max(motion_threshold * 3, 0.05)
+        for i, disp in enumerate(consecutive_disps):
+            if disp > onset_threshold:
+                motion_onset_idx = i
+                break
+
+        # 如果全局位移大但逐帧检测不到onset → 用全局搜索
+        if global_disp > max(motion_threshold * 2, 0.04) and motion_onset_idx == 0:
+            n_search = max(1, num_valid_frames // 3)
+            for i in range(n_search, len(valid_centroids)):
+                disp_from_start = np.linalg.norm(valid_centroids[i][1] - head_mean)
+                if disp_from_start > max(motion_threshold * 3, 0.06):
+                    motion_onset_idx = i - 1
+                    break
+
+        pre_motion_frame_ids = [valid_centroids[j][0] for j in range(motion_onset_idx + 1)]
+
+        # 在运动前的帧中选面积最大的
+        if pre_motion_frame_ids:
+            best_frame = -1
+            max_area = 0
+            for instance_mask in instance_masks:
+                if instance_mask['frame_id'] in pre_motion_frame_ids:
+                    area = compute_surface_area_from_pointmap(
+                        world_points[instance_mask['frame_id']], instance_mask['mask']
+                    )
+                    if area > max_area:
+                        max_area = area
+                        best_frame = instance_mask['frame_id']
+            if best_frame >= 0:
+                return best_frame, True, motion_info
+
+        return first_valid_frame, True, motion_info
+
+    else:
+        # 静态物体: 选3D表面积最大的帧
+        optimal_frame_id = -1
+        max_area = 0
+        for instance_mask in instance_masks:
+            frame_id = instance_mask['frame_id']
+            mask = instance_mask['mask']
+            pointmap = world_points[frame_id]
+            area = compute_surface_area_from_pointmap(pointmap, mask)
+            if area > max_area:
+                max_area = area
+                optimal_frame_id = frame_id
+        return optimal_frame_id, False, motion_info
+```
+
+**动静态判断的关键参数**:
+
+| 参数 | 值 | 含义 |
+|------|-----|------|
+| `motion_threshold` | 0.02m | 逐帧中位数位移阈值，超过则认为动态 |
+| `global_disp阈值` | max(0.04, 2×motion_threshold) | 首尾质心距离阈值 |
+| `onset_threshold` | max(0.05, 3×motion_threshold) | 运动起始帧的位移突变阈值 |
+
+### 6.3 3D资产生成 — generate_3d_asset_in_subprocess() 实际代码
+
+**代码位置**: `src/instance_generation.py:129-174`
+
+```python
+def generate_3d_asset_in_subprocess(
+    deduplicated_all_masks,
+    all_optimal_frame_ids,
+    colors,
+    world_points,
+    extrinsics,
+    config_file="./models/SAM3D/checkpoints/pipeline.yaml",
+    compile_model=False,
+):
+    # 使用spawn方式创建子进程，避免CUDA上下文冲突
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    process = ctx.Process(
+        target=_generate_all_instances_worker,
+        args=(queue, deduplicated_all_masks, all_optimal_frame_ids,
+              colors, world_points, extrinsics, config_file, compile_model),
+    )
+    process.start()
+    # 读取结果（超时7200秒）
+    ok, payload = queue.get(timeout=7200)
+    process.join(timeout=30)
+    if ok:
+        return payload
+    raise RuntimeError(payload)
+```
+
+**子进程中的实际生成逻辑** (`_generate_all_instances_worker`):
+
+```python
+def _generate_all_instances_worker(queue, deduplicated_all_masks, all_optimal_frame_ids,
+                                    colors, world_points, extrinsics, config_file, compile_model):
+    inference = Inference(config_file=config_file, compile=compile_model)
+    all_instances = {}
+    for category, category_masks in deduplicated_all_masks.items():
+        all_instances[category] = []
+        for instance_masks, optimal_frame_id in zip(category_masks, all_optimal_frame_ids[category]):
+            # 从最优帧提取输入数据
+            image = colors[optimal_frame_id]                          # RGB图像
+            mask = next(im["mask"] for im in instance_masks
+                        if im["frame_id"] == optimal_frame_id)       # 最优帧的mask
+            pointmap = world_points[optimal_frame_id]                # 世界坐标点云
+            extrinsic = extrinsics[optimal_frame_id]                 # 相机外参
+
+            # 调用SAM3D生成3D资产
+            instance_result = generate_3d_asset(image, mask, pointmap, extrinsic, inference)
+            all_instances[category].append(instance_result)
+
+    queue.put((True, all_instances))
+```
+
+### 6.4 T矩阵计算 — generate_3d_asset() 实际代码
+
+**代码位置**: `src/instance_generation.py:12-54`
+
+```python
+def generate_3d_asset(image, mask, pointmap, extrinsic, inference):
+    H, W = pointmap.shape[:2]
+
+    # ── Step A: 将世界坐标点云转换为相机坐标系 ──
+    points_world_flat = pointmap.reshape(-1, 3)           # (H*W, 3)
+    ones = np.ones((points_world_flat.shape[0], 1))
+    points_world_hom = np.hstack([points_world_flat, ones])  # (H*W, 4)
+
+    # VGGT格式 → SAM3D格式: 翻转x和y轴
+    flip_xy = np.array([[-1,0,0,0],[0,-1,0,0],[0,0,1,0],[0,0,0,1]])
+    points_cam_hom = (flip_xy @ extrinsic @ points_world_hom.T).T  # (H*W, 4)
+    points_cam_flat = points_cam_hom[:, :3]
+    point_map_camera = torch.from_numpy(points_cam_flat).reshape(H, W, 3).to(torch.float32)
+    point_map_camera = point_map_camera.contiguous()
+
+    # ── Step B: SAM3D推理 ──
+    output = inference(image, mask, seed=42, pointmap=point_map_camera)
+    original_mesh = output["glb"]
+
+    # ── Step C: 计算l2c矩阵 (local → camera) ──
+    R_l2c = quaternion_to_matrix(output["rotation"])
+    l2c_transform = compose_transform(
+        scale=output["scale"],
+        rotation=R_l2c,
+        translation=output["translation"],
+    )
+    matrix_l2c = l2c_transform.get_matrix()[0].transpose(0, 1).detach().cpu().numpy()
+
+    # ── Step D: 计算T矩阵 (local → world) ──
+    matrix_y2z = np.array([[1,0,0,0],[0,0,-1,0],[0,1,0,0],[0,0,0,1]], dtype=np.float32)
+    matrix_adjust = np.diag([-1, -1, 1, 1])
+    matrix_ext_inv = np.linalg.inv(extrinsic)
+    final_transform = matrix_ext_inv @ matrix_adjust @ matrix_l2c @ matrix_y2z
+
+    return {"original_mesh": original_mesh, "T": final_transform}
+```
+
+**T矩阵中各分量的数值示例** (以232场景为例):
+
+```
+extrinsic (c2w) = [R_c2w | t_c2w]  — VGGT预测的相机位姿
+  例: [[0.99, -0.05, 0.12, 0.30],
+       [0.05,  0.99, -0.02, -0.15],
+       [-0.12, 0.02, 0.99, 1.20],
+       [0,     0,    0,    1.00]]
+
+inv(extrinsic) = [R_c2w^T | -R_c2w^T @ t_c2w]  — world→camera 的逆
+  这一步将相机坐标系中的物体位置映射到世界坐标系
+  **决定了物体在世界中的3D位置**
+
+matrix_l2c — SAM3D输出的局部→相机变换
+  包含物体的形状、大小、朝向信息
+  受 pointmap (几何条件输入) 影响
+
+matrix_adjust = diag(-1, -1, 1, 1)
+  修正VGGT和SAM3D之间的坐标系差异
+
+matrix_y2z — y-up → z-up
+  SAM3D输出是y-up格式，转为z-up格式
+```
+
+### 6.5 3D表面积计算 — compute_surface_area_from_pointmap() 实际代码
+
+**代码位置**: `src/geometry_utils.py:6-56`
+
+```python
+def compute_surface_area_from_pointmap(pointmap, mask, max_triangle_size=2e-4):
+    H, W, _ = pointmap.shape
+    y_coords, x_coords = np.where(mask)
+    if len(y_coords) < 3:
+        return 0.0
+    points_3d = pointmap[y_coords, x_coords]
+    pixel_coords = np.column_stack([x_coords, y_coords])
+
+    tri = Delaunay(pixel_coords)
+    simplices = tri.simplices
+    triangles_3d = points_3d[simplices]
+
+    AB = triangles_3d[:, 1] - triangles_3d[:, 0]
+    AC = triangles_3d[:, 2] - triangles_3d[:, 0]
+    cross_product = np.cross(AB, AC)
+    triangle_areas = 0.5 * np.linalg.norm(cross_product, axis=1)
+
+    valid_triangle_mask = (triangle_areas > 0) & (triangle_areas < max_triangle_size)
+    return float(np.sum(triangle_areas[valid_triangle_mask]))
+```
+
+**注意**: `max_triangle_size=2e-4` 是一个硬编码阈值，过滤掉面积过大的异常三角形。如果点云噪声大（如VGGT-omega），可能产生大量异常三角形，导致面积计算不准。
+
+### 6.6 Stage 3 数据流图
+
+```
+deduplicated_all_masks                    vggt_prediction_results
+        │                                         │
+        │  ┌──────────────────────────────────────┤
+        │  │                                      │
+        ▼  ▼                                      ▼
+┌──────────────────────┐              ┌─────────────────────┐
+│ get_optimal_view_    │              │ world_points[s]     │
+│ frame_id()           │              │ extrinsics[s]       │
+│                      │              │ colors[s]           │
+│ 输入: world_points,  │              └─────────┬───────────┘
+│       instance_masks │                        │
+│ 输出: optimal_frame_ │                        │
+│       id, is_dynamic │                        │
+└──────────┬───────────┘                        │
+           │                                    │
+           ▼                                    ▼
+┌──────────────────────────────────────────────────────────┐
+│ generate_3d_asset_in_subprocess()                         │
+│                                                          │
+│  对每个实例:                                              │
+│    image = colors[optimal_frame_id]                       │
+│    mask = instance_masks中frame_id==optimal_frame_id的mask│
+│    pointmap = world_points[optimal_frame_id]              │
+│    extrinsic = extrinsics[optimal_frame_id]               │
+│                                                          │
+│    → generate_3d_asset(image, mask, pointmap, extrinsic)  │
+│      → pointmap世界→相机坐标转换                          │
+│      → SAM3D推理 → mesh + (scale, rotation, translation)  │
+│      → T = inv(ext) @ adjust @ l2c @ y2z                 │
+│                                                          │
+│  输出: all_instances = {category: [{original_mesh, T}]}   │
+└──────────────────────┬───────────────────────────────────┘
+                       │
+                       ▼
+┌──────────────────────────────────────────────────────────┐
+│ verify_all_instances() — 多票验证                         │
+│                                                          │
+│  对每个实例的每个验证帧:                                   │
+│    将mesh投影到验证帧 → 与mask比较 → 投票                  │
+│  保留投票数 >= min_votes 的实例                           │
+└──────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 七、手部遮挡问题的深度分析与改进建议
+
+### 7.1 问题描述
+
+在手物交互(HOI)场景中，手部遮挡物体会导致以下连锁问题：
+
+```
+手部遮挡物体
+    │
+    ├──→ SAM3跟踪断裂 → 同一物体产生多个实例（最严重）
+    │     └──→ 跨类去重可能合并不同物体
+    │
+    ├──→ mask包含手部区域 → SAM3D生成包含手部几何的mesh
+    │     └──→ mesh质量差 → T矩阵计算偏移
+    │
+    ├──→ 手部区域的pointmap是手的深度 → SAM3D几何条件输入错误
+    │     └──→ l2c矩阵计算偏移 → 物体位置偏移
+    │
+    └──→ 最优帧选择时手部遮挡帧被选中 → 生成的3D资产质量差
+          └──→ 该帧的mask和pointmap都包含手部信息
+```
+
+### 7.2 长时间遮挡的特殊问题
+
+当手部长时间遮挡物体（如持续握持）时：
+
+1. **SAM3完全丢失跟踪**: 物体在所有帧中都被手遮挡，SAM3无法分割出物体mask
+2. **短间隙合并无效**: 即使将帧间隙阈值从1改为5，长时间遮挡仍然会导致实例断裂
+3. **手部掩码去除的局限**: 将手部区域设为黑色（深度为0）后：
+   - SAM3D无法估计被遮挡区域的深度 → 生成不完整的mesh
+   - pointmap中手部区域变为无效值 → 几何条件输入缺失
+   - 本质上，黑色区域 = 无信息，无法恢复被遮挡的3D结构
+
+### 7.3 改进方案（按优先级排序）
+
+#### 方案1: 手部感知的最优帧选择（推荐，改动最小，效果最好）
+
+**核心思想**: 在选择最优帧时，优先选择手部遮挡少的帧。
+
+**实现位置**: `src/geometry_utils.py` 的 `get_optimal_view_frame_id()`
+
+```python
+def get_optimal_view_frame_id(world_points, instance_masks, motion_threshold=0.02,
+                               hand_masks=None):
+    """
+    新增参数:
+        hand_masks: dict, {frame_id: np.ndarray(H, W)} 手部二值mask
+                    可通过 MediaPipe Hands 或 SAM3 "hand" 类别获取
+    """
+    # ... 现有质心计算和动静态判断逻辑不变 ...
+
+    # ── 新增: 在选择最优帧时考虑手部遮挡 ──
+    if is_dynamic:
+        # 动态物体: 在运动前的帧中选面积最大且手部遮挡最小的帧
+        best_frame = -1
+        best_score = -1
+        for instance_mask in instance_masks:
+            if instance_mask['frame_id'] not in pre_motion_frame_ids:
+                continue
+            area = compute_surface_area_from_pointmap(
+                world_points[instance_mask['frame_id']], instance_mask['mask']
+            )
+            # 手部遮挡惩罚
+            hand_penalty = 0.0
+            if hand_masks is not None and instance_mask['frame_id'] in hand_masks:
+                mask = instance_mask['mask']
+                hand = hand_masks[instance_mask['frame_id']]
+                hand_overlap = np.sum(mask & hand) / max(np.sum(mask), 1)
+                hand_penalty = hand_overlap * area  # 遮挡比例 × 面积
+            score = area - hand_penalty
+            if score > best_score:
+                best_score = score
+                best_frame = instance_mask['frame_id']
+    else:
+        # 静态物体: 同样考虑手部遮挡
+        best_frame = -1
+        best_score = -1
+        for instance_mask in instance_masks:
+            frame_id = instance_mask['frame_id']
+            mask = instance_mask['mask']
+            pointmap = world_points[frame_id]
+            area = compute_surface_area_from_pointmap(pointmap, mask)
+            hand_penalty = 0.0
+            if hand_masks is not None and frame_id in hand_masks:
+                hand = hand_masks[frame_id]
+                hand_overlap = np.sum(mask & hand) / max(np.sum(mask), 1)
+                hand_penalty = hand_overlap * area
+            score = area - hand_penalty
+            if score > best_score:
+                best_score = score
+                best_frame = frame_id
+```
+
+**手部mask获取方式**:
+
+```python
+# 方式A: 使用SAM3分割 "hand" 类别（推荐，已有基础设施）
+sam3_video_model.handle_request(dict(type="add_prompt", frame_index=0, text="hand"))
+hand_outputs = propagate_in_video(sam3_video_model, session_id)
+hand_masks = {}  # {frame_id: binary_mask}
+for frame_idx, output in hand_outputs.items():
+    for obj_id in output['out_obj_ids']:
+        mask = output['out_binary_masks'][obj_id].squeeze() > 0
+        if frame_idx not in hand_masks:
+            hand_masks[frame_idx] = np.zeros_like(mask, dtype=bool)
+        hand_masks[frame_idx] |= mask
+
+# 方式B: 使用MediaPipe Hands（轻量，CPU即可运行）
+import mediapipe as mp
+hands_detector = mp.solutions.hands.Hands(
+    static_image_mode=False, max_num_hands=2,
+    min_detection_confidence=0.5
+)
+hand_masks = {}
+for frame_idx, image in enumerate(colors):
+    results = hands_detector.process(cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+    if results.multi_hand_landmarks:
+        # 将手部关键点膨胀为mask
+        hand_mask = np.zeros(image.shape[:2], dtype=bool)
+        for hand_lms in results.multi_hand_landmarks:
+            for lm in hand_lms.landmark:
+                x, y = int(lm.x * image.shape[1]), int(lm.y * image.shape[0])
+                # 膨胀半径20像素
+                hand_mask[max(0,y-20):y+20, max(0,x-20):x+20] = True
+        hand_masks[frame_idx] = hand_mask
+```
+
+#### 方案2: mask后处理 — 从物体mask中去除手部区域
+
+**实现位置**: `mainv2.py` 的 `run_stage3()` 中，在 `generate_3d_asset_in_subprocess` 之前
+
+```python
+# 在 run_stage3 中，3D资产生成之前:
+if hand_masks is not None:
+    for category, category_masks in deduplicated_all_masks.items():
+        for inst_idx, instance_masks in enumerate(category_masks):
+            for im in instance_masks:
+                fid = im['frame_id']
+                if fid in hand_masks:
+                    # 从物体mask中减去手部区域
+                    im['mask'] = im['mask'] & (~hand_masks[fid])
+```
+
+**局限**:
+- 去除手部后mask可能变小或不连续
+- SAM3D可能生成不完整的mesh（缺少被遮挡部分）
+- 如果手部遮挡面积过大，去除后mask可能太小无法生成有效mesh
+
+#### 方案3: mesh后处理 — 连通分量清理
+
+**实现位置**: `src/instance_generation.py` 的 `generate_3d_asset()` 返回前
+
+```python
+def clean_mesh(mesh, min_component_ratio=0.3):
+    """保留最大连通分量，去除小碎片（如手指状突起）"""
+    components = mesh.split(only_watertight=False)
+    if len(components) <= 1:
+        return mesh
+    max_area = max(c.area for c in components)
+    large_components = [c for c in components if c.area > max_area * min_component_ratio]
+    if not large_components:
+        return max(components, key=lambda c: c.area)
+    return trimesh.util.concatenate(large_components)
+
+# 在 generate_3d_asset 返回前:
+original_mesh = clean_mesh(output["glb"])
+```
+
+**优点**: 不需要手部检测，直接清理mesh中的小碎片
+**局限**: 如果手部和物体在同一个连通分量中，无法分离
+
+#### 方案4: 2D时序连续性去重（解决跟踪断裂导致的重复实例）
+
+**实现位置**: `src/sg_deduplication.py`
+
+当SAM3因手部遮挡导致跟踪断裂，同一物体被分成多个实例时，用2D时序连续性判断是否为同一物体：
+
+```python
+def temporal_continuity_deduplicate(all_masks, min_iou=0.3):
+    """2D时序连续性去重: 如果两个实例在时序上首尾相接且2D IoU高，则合并"""
+    for category, instances in all_masks.items():
+        merged = []
+        used = set()
+        for i in range(len(instances)):
+            if i in used:
+                continue
+            current = instances[i]
+            last_frame = max(im['frame_id'] for im in current)
+            last_mask = next(im['mask'] for im in current if im['frame_id'] == last_frame)
+
+            for j in range(i + 1, len(instances)):
+                if j in used:
+                    continue
+                other = instances[j]
+                first_frame = min(im['frame_id'] for im in other)
+                first_mask = next(im['mask'] for im in other if im['frame_id'] == first_frame)
+
+                # 检查时序连续性: 一个实例的最后一帧和另一个实例的第一帧相邻
+                if abs(first_frame - last_frame) <= 5:  # 允许5帧间隙
+                    # 检查2D IoU
+                    intersection = np.sum(last_mask & first_mask)
+                    union = np.sum(last_mask | first_mask)
+                    iou = intersection / max(union, 1)
+                    if iou > min_iou:
+                        # 合并两个实例
+                        current = current + other
+                        used.add(j)
+
+            merged.append(current)
+        all_masks[category] = merged
+    return all_masks
+```
+
+#### 方案5: 多帧融合3D资产生成（长期方案）
+
+当单帧无法获得完整物体时，融合多帧信息：
+
+```python
+def generate_3d_asset_multi_frame(image_list, mask_list, pointmap_list, extrinsic_list, inference):
+    """从多帧生成3D资产，取各帧mask的并集作为完整mask"""
+    # 取所有帧mask的并集
+    union_mask = np.zeros_like(mask_list[0], dtype=bool)
+    for mask in mask_list:
+        # 去除手部区域后取并集
+        clean_mask = mask & (~hand_mask) if hand_mask is not None else mask
+        union_mask |= clean_mask
+
+    # 选择手部遮挡最少的帧作为主帧
+    best_idx = argmin(hand_overlap(mask, hand_mask) for mask in mask_list)
+
+    # 用主帧的图像 + 并集mask生成3D资产
+    return generate_3d_asset(
+        image_list[best_idx], union_mask,
+        pointmap_list[best_idx], extrinsic_list[best_idx], inference
+    )
+```
+
+### 7.4 方案优先级与实施建议
+
+| 优先级 | 方案 | 改动量 | 效果 | 适用场景 | 依赖 |
+|--------|------|--------|------|---------|------|
+| 🥇 | 方案1: 手部感知帧选择 | ⭐小 | ⭐⭐⭐⭐ | 手部短暂遮挡 | MediaPipe/SAM3手部检测 |
+| 🥈 | 方案3: mesh连通分量清理 | ⭐小 | ⭐⭐⭐ | 手部几何混入mesh | 无 |
+| 🥉 | 方案4: 2D时序连续性去重 | ⭐⭐中 | ⭐⭐⭐⭐ | 跟踪断裂导致重复实例 | 无 |
+| 4 | 方案2: mask去除手部 | ⭐小 | ⭐⭐ | 手部区域明确 | 手部检测 |
+| 5 | 方案5: 多帧融合 | ⭐⭐⭐大 | ⭐⭐⭐⭐⭐ | 长时间遮挡 | 手部检测+多帧对齐 |
+
+**推荐实施顺序**: 方案1 → 方案3 → 方案4 → 方案2 → 方案5
+
+方案1和方案3可以立即实施，无需额外依赖。方案4解决跟踪断裂问题，是中期最重要的改进。方案5是长期目标，需要多帧对齐技术支持。
+
+---
+
+## 八、3D物体摆放位置的影响因素总结
+
+### 8.1 位置精度的影响链
+
+```
+VGGT点云质量 ──────────────────────────────────────────────┐
+  │ (世界坐标精度)                                           │
+  ▼                                                         │
+pointmap精度 ──→ SAM3D几何条件 ──→ l2c矩阵精度 ──→ T矩阵   │
+                                                    位置分量 │
+                                                            │
+extrinsic精度 ──→ inv(extrinsic) ──────────────→ T矩阵位置分量
+  │ (相机位姿精度)                                           │
+  ▼                                                         │
+坐标系对齐 ──→ R, t变换 ──→ world_points和extrinsics都已对齐  │
+                                                            │
+SAM3 mask质量 ──→ SAM3D分割区域 ──→ mesh形状和l2c ──→ T矩阵  │
+                                                            │
+语义精修 ──→ 修改T的平移分量 ──→ 最终位置                     │
+```
+
+### 8.2 各因素对位置的影响程度
+
+| 因素 | 影响程度 | 影响方式 | 可修复性 |
+|------|---------|---------|---------|
+| extrinsic误差 | ⭐⭐⭐⭐⭐ | 直接决定物体在世界中的位置 | Stage4 ICP对齐可部分修复 |
+| pointmap误差 | ⭐⭐⭐⭐ | 影响SAM3D的l2c计算 | 无法直接修复 |
+| mask不干净(含手部) | ⭐⭐⭐ | SAM3D生成包含手部的mesh | 方案1/2/3可缓解 |
+| 坐标系对齐误差 | ⭐⭐⭐ | 所有物体位置系统性偏移 | 依赖floor/wall分割质量 |
+| 动态/静态误判 | ⭐⭐ | 选错最优帧 → mesh质量差 | 改进判断逻辑 |
+| 精修阈值(0.3m) | ⭐⭐ | 超过阈值的物体不精修 | 可调整阈值 |
+
+### 8.3 main.py vs mainv2.py 在3D摆放上的关键差异
+
+| 差异点 | main.py | mainv2.py | 影响 |
+|--------|---------|-----------|------|
+| 精修写回 | ❌ 未写回 `category_instances[instance_id]` | ✅ L815 已修复 | main.py所有精修结果丢失 |
+| 关系格式 | 只支持 `supported_by_floor` | ✅ 兼容两种格式 | main.py无法处理空格格式 |
+| 跨类去重保护 | ❌ 无 | ✅ `protected_categories` | 防止不同物体被错误合并 |
+| 动态判断 | 首尾帧位移 | ✅ 中位数+全局位移 | 更鲁棒的动静态分类 |
+| 物体间精修 | ❌ 未实现 | ✅ Stage 5.1+5.2 | 桌上物体悬空问题 |
+| pkl保存 | ❌ 无 | ✅ 保留原始T+mesh | 后处理管线可独立运行 |

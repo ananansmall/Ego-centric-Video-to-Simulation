@@ -1,6 +1,6 @@
 """
-VGGT TrackHead 联合点追踪模块 (point_tracker.py)
-=================================================
+Step 1: VGGT TrackHead 联合点追踪
+==================================
 
 核心思路 (V-Dreamer):
   视频本身就是最好的运动先验。
@@ -10,7 +10,7 @@ VGGT TrackHead 联合点追踪模块 (point_tracker.py)
 数据流:
   VGGT4D Stage 1 (无 query_points)
     → depth, extrinsics, dynamic_mask, qk_dict
-  采样 query_points (从 dynamic_mask 或 SAM3 mask)
+  采样 query_points (从 dynamic_mask - hand_mask)
   VGGT4D Stage 2 (带 dyn_masks + query_points)
     → refined extrinsics + tracked 2D trajectories
   深度反投影
@@ -71,20 +71,8 @@ def load_vggt4d_model(ckpt_path=None, device="cuda"):
 def run_vggt4d_stage1(model, images, device="cuda"):
     """VGGT4D Stage 1: 预测深度图和动态图
 
-    Args:
-        model: VGGTFor4D 模型
-        images: (S, 3, H, W) 预处理后的图像张量
-        device: 推理设备
-
     Returns:
-        dict: {
-            predictions: Stage 1 预测结果 (含 depth, extrinsic, intrinsic),
-            qk_dict: 组织后的 QK 注意力字典,
-            enc_feat: 编码器特征,
-            agg_tokens_list: 聚合 token 列表 (仅保留 4/11/17/23 层),
-            dyn_masks: (S, H, W) bool 动态掩码,
-            images: 原始图像张量,
-        }
+        dict: {predictions, qk_dict, dyn_masks}
     """
     from einops import rearrange
     import torch.nn.functional as F
@@ -128,10 +116,6 @@ def run_vggt4d_stage1(model, images, device="cuda"):
 def run_vggt4d_stage2_with_tracking(model, images, dyn_masks, query_points, device="cuda"):
     """VGGT4D Stage 2: 用动态掩码精化外参 + TrackHead 联合追踪
 
-    关键: 在 Stage 2 中同时传入 query_points, 一次前向传播同时获得:
-      - 精化后的相机外参
-      - 追踪的 2D 点轨迹
-
     Args:
         model: VGGTFor4D 模型
         images: (S, 3, H, W) 图像张量
@@ -140,10 +124,7 @@ def run_vggt4d_stage2_with_tracking(model, images, dyn_masks, query_points, devi
         device: 推理设备
 
     Returns:
-        dict: {
-            predictions: Stage 2 预测结果 (含精化 extrinsic + track/vis/conf),
-            has_tracking: 是否成功获取追踪结果,
-        }
+        dict: {predictions, has_tracking}
     """
     if isinstance(query_points, np.ndarray):
         query_points = torch.from_numpy(query_points).float()
@@ -164,13 +145,6 @@ def run_vggt4d_stage2_with_tracking(model, images, dyn_masks, query_points, devi
 
 def run_vggt4d_stage3_refine_mask(model, images, predictions, dyn_masks, device="cuda"):
     """VGGT4D Stage 3: 精化动态掩码
-
-    Args:
-        model: VGGTFor4D 模型 (未使用, 保留接口一致性)
-        images: (S, 3, H, W) 图像张量
-        predictions: 合并后的预测结果
-        dyn_masks: (S, H, W) bool 粗动态掩码
-        device: 推理设备
 
     Returns:
         refined_mask: (S, H, W) bool 精化后的动态掩码
@@ -199,10 +173,7 @@ def sample_query_points_from_mask(mask, n_points=64, method="grid", margin=5):
     Args:
         mask: (H, W) bool 二值掩码
         n_points: 采样点数
-        method: 采样方法
-            "grid" - 网格采样 (均匀覆盖)
-            "random" - 随机采样
-            "contour" - 轮廓+内部采样 (边缘+中心)
+        method: 采样方法 ("grid"/"random"/"contour")
         margin: 距离边缘的最小像素数
 
     Returns:
@@ -274,36 +245,6 @@ def sample_query_points_from_mask(mask, n_points=64, method="grid", margin=5):
         raise ValueError(f"Unknown sampling method: {method}")
 
 
-def sample_query_points_from_sam3_mask(object_masks, frame_id=0, n_points=64):
-    """从 SAM3 物体分割 mask 中采样查询点
-
-    Args:
-        object_masks: Dict[category, List[List[{frame_id, mask}]]]
-        frame_id: 参考帧 ID
-        n_points: 采样点数
-
-    Returns:
-        dict: {obj_key: query_points (N, 2)} 每个物体的查询点
-    """
-    result = {}
-    for cat, instances in object_masks.items():
-        for inst_idx, inst_masks in enumerate(instances):
-            ref_mask = None
-            for m in inst_masks:
-                if m["frame_id"] == frame_id:
-                    ref_mask = m["mask"]
-                    break
-            if ref_mask is None and len(inst_masks) > 0:
-                ref_mask = inst_masks[0]["mask"]
-
-            if ref_mask is not None:
-                pts = sample_query_points_from_mask(ref_mask, n_points=n_points)
-                obj_key = f"{cat}_inst{inst_idx}"
-                result[obj_key] = pts
-
-    return result
-
-
 def unproject_tracks_to_3d(tracks_2d, depths, extrinsics, intrinsic):
     """将 2D 追踪轨迹反投影到 3D 世界坐标
 
@@ -357,15 +298,13 @@ def subtract_hand_mask(dynamic_mask, hand_masks, scale_factor=None):
     """从 dynamic_mask 中减去手部区域, 只保留物体区域
 
     Args:
-        dynamic_mask: (S, H_v, W_v) bool VGGT4D 动态掩码 (VGGT分辨率, 通常518x292)
-        hand_masks: (S, H_orig, W_orig) bool HaWoR 手部掩码 (原始分辨率, 如1080x1920)
-        scale_factor: tuple (scale_y, scale_x) 手部mask到VGGT分辨率的缩放因子
+        dynamic_mask: (S, H_v, W_v) bool VGGT4D 动态掩码
+        hand_masks: (S, H_orig, W_orig) bool HaWoR 手部掩码
+        scale_factor: tuple (scale_y, scale_x) 缩放因子
 
     Returns:
-        object_only_mask: (S, H_v, W_v) bool 物体区域掩码 (dynamic - hand)
+        object_only_mask: (S, H_v, W_v) bool 物体区域掩码
     """
-    import torch
-
     if isinstance(dynamic_mask, torch.Tensor):
         dynamic_mask = dynamic_mask.cpu().numpy()
     if isinstance(hand_masks, torch.Tensor):
@@ -427,7 +366,7 @@ def sample_query_points_from_dynamic_mask(dynamic_mask, hand_masks=None, n_point
             if m.any():
                 ref_mask = m
                 reference_frame = t
-                print(f"[point_tracker] Using frame {t} as reference (first with object mask)")
+                print(f"[02_point_tracker] Using frame {t} as reference (first with object mask)")
                 break
 
     if not ref_mask.any():
@@ -442,7 +381,6 @@ def sample_query_points_from_dynamic_mask(dynamic_mask, hand_masks=None, n_point
 
 def run_point_tracking(
     video_path_or_images,
-    object_masks=None,
     hand_masks=None,
     n_query_points=64,
     query_point_method="grid",
@@ -455,7 +393,7 @@ def run_point_tracking(
 
     Args:
         video_path_or_images: 视频路径 (str) 或预处理图像 (S,3,H,W) 张量
-        object_masks: SAM3 物体分割 mask (可选, 用于精确采样查询点)
+        hand_masks: (S, H_orig, W_orig) bool HaWoR 手部掩码 (可选)
         n_query_points: 每个物体的查询点数
         query_point_method: 采样方法 ("grid"/"random"/"contour")
         reference_frame: 参考帧 ID
@@ -465,16 +403,9 @@ def run_point_tracking(
 
     Returns:
         dict: {
-            vggt_predictions: VGGT4D 预测结果 (depth, extrinsic, intrinsic, cam2world),
+            vggt_predictions: VGGT4D 预测结果,
             dynamic_mask: (S, H, W) bool 精化动态掩码,
-            object_tracks: {obj_key: {
-                tracks_2d: (S, N, 2),
-                tracks_3d: (S, N, 3),
-                visibility: (S, N),
-                confidence: (S, N),
-                valid_3d: (S, N) bool,
-                query_points: (N, 2),
-            }},
+            object_tracks: {obj_key: {tracks_2d, tracks_3d, visibility, confidence, valid_3d, query_points}},
         }
     """
     model = load_vggt4d_model(ckpt_path, device)
@@ -502,27 +433,22 @@ def run_point_tracking(
         images = video_path_or_images.to(device)
 
     S = images.shape[0]
-    print(f"[point_tracker] Loaded {S} frames, running VGGT4D Stage 1...")
+    print(f"[02_point_tracker] Loaded {S} frames, running VGGT4D Stage 1...")
 
     stage1 = run_vggt4d_stage1(model, images, device)
     dyn_masks = stage1["dyn_masks"]
-    print(f"[point_tracker] Stage 1 done. Dynamic mask: {dyn_masks.shape}")
+    print(f"[02_point_tracker] Stage 1 done. Dynamic mask: {dyn_masks.shape}")
 
-    if object_masks is not None:
-        query_points_dict = sample_query_points_from_sam3_mask(
-            object_masks, frame_id=reference_frame, n_points=n_query_points
-        )
-    else:
-        query_points_dict = sample_query_points_from_dynamic_mask(
-            dyn_masks.cpu().numpy() if isinstance(dyn_masks, torch.Tensor) else dyn_masks,
-            hand_masks=hand_masks,
-            n_points=n_query_points,
-            method=query_point_method,
-            reference_frame=reference_frame,
-        )
+    query_points_dict = sample_query_points_from_dynamic_mask(
+        dyn_masks.cpu().numpy() if isinstance(dyn_masks, torch.Tensor) else dyn_masks,
+        hand_masks=hand_masks,
+        n_points=n_query_points,
+        method=query_point_method,
+        reference_frame=reference_frame,
+    )
 
     if not query_points_dict:
-        print("[point_tracker] No query points sampled, returning without tracking")
+        print("[02_point_tracker] No query points sampled, returning without tracking")
         return {
             "vggt_predictions": stage1["predictions"],
             "dynamic_mask": dyn_masks.cpu().numpy(),
@@ -533,14 +459,14 @@ def run_point_tracking(
     for obj_key, qp in query_points_dict.items():
         if len(qp) == 0:
             continue
-        print(f"[point_tracker] Tracking {len(qp)} points for '{obj_key}'...")
+        print(f"[02_point_tracker] Tracking {len(qp)} points for '{obj_key}'...")
 
         stage2 = run_vggt4d_stage2_with_tracking(
             model, images, dyn_masks, qp, device
         )
 
         if not stage2["has_tracking"]:
-            print(f"[point_tracker] WARNING: No tracking result for '{obj_key}'")
+            print(f"[02_point_tracker] WARNING: No tracking result for '{obj_key}'")
             continue
 
         pred = stage2["predictions"]
@@ -580,11 +506,11 @@ def run_point_tracking(
     else:
         final_predictions = stage1["predictions"]
 
-    print("[point_tracker] Running Stage 3: refine dynamic mask...")
+    print("[02_point_tracker] Running Stage 3: refine dynamic mask...")
     refined_mask = run_vggt4d_stage3_refine_mask(
         model, images, final_predictions, dyn_masks, device
     )
-    print("[point_tracker] Stage 3 done.")
+    print("[02_point_tracker] Stage 3 done.")
 
     depths = final_predictions["depth"]
     if depths.ndim == 4 and depths.shape[-1] == 1:
@@ -600,7 +526,7 @@ def run_point_tracking(
         track_data["valid_3d"] = valid_3d
         n_valid = valid_3d.sum()
         n_total = valid_3d.size
-        print(f"[point_tracker] '{obj_key}': {n_valid}/{n_total} valid 3D points")
+        print(f"[02_point_tracker] '{obj_key}': {n_valid}/{n_total} valid 3D points")
 
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
@@ -618,7 +544,7 @@ def run_point_tracking(
                 for obj_key, t in all_tracks.items()
             },
         )
-        print(f"[point_tracker] Results saved to {output_dir}/point_tracks.npz")
+        print(f"[02_point_tracker] Results saved to {output_dir}/point_tracks.npz")
 
     return {
         "vggt_predictions": final_predictions,

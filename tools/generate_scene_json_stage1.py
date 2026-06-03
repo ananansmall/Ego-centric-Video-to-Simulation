@@ -2014,7 +2014,8 @@ def main():
     parser.add_argument('--output_json', type=str, default=None, help='输出 JSON 路径')
     parser.add_argument('--output_dir', type=str, default=None, help='输出目录 (保存关键帧和元数据, 默认与output_json同目录)')
     parser.add_argument('--vlm_checkpoint', type=str, default=None, help='VLM 模型路径')
-    parser.add_argument('--max_frames', type=int, default=10, help='VGGT采样最大帧数')
+    parser.add_argument('--max_frames', type=int, default=10, help='VGGT采样最大帧数 (SimRecon贪心采样)')
+    parser.add_argument('--vggt_max_frames', type=int, default=160, help='VGGT 3D重建最大帧数 (默认160, 与mainv2 --max_frames一致)')
     parser.add_argument('--temp_dir', type=str, default='./temp_frames_stage2', help='临时帧目录')
     parser.add_argument('--centroid_dist_thre', type=float, default=0.15, help='3D去重质心距离阈值/米')
     parser.add_argument('--use_sam', type=str, default='auto', choices=['auto', 'yes', 'no'], help='SAM3 floor/wall分割')
@@ -2067,7 +2068,7 @@ def main():
         print(f"{'='*70}", flush=True)
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        frames = load_video_frames(args.input_video, max_frames=160).to(device)
+        frames = load_video_frames(args.input_video, max_frames=args.vggt_max_frames).to(device)
         print(f"   加载 {len(frames)} 帧用于VGGT重建", flush=True)
 
         vggt_model = load_vggt_model().to(device)
