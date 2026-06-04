@@ -307,24 +307,24 @@ def align_vggt_predictions(predictions, R, t):
 def get_optimal_view_frame_id(world_points, instance_masks, motion_threshold=0.02):
     '''
     Get the optimal view frame id for each instance.
-    Uses TWO motion detection signals:
-      1. Consecutive-frame median displacement (catches gradual drift)
-      2. Global displacement: centroid distance between first 20% and last 20% of frames (catches true motion that consecutive analysis misses due to VGGT drift smoothing)
-    
-    An object is classified as DYNAMIC if EITHER signal exceeds its threshold.
-    This is more robust than using consecutive displacement alone, which can miss
-    dynamic objects when VGGT drift smooths out per-frame displacements.
 
-    For dynamic objects: finds the "motion onset" frame (where displacement spikes),
-    then selects the frame with largest 3D surface area BEFORE motion starts.
-    
+    策略:
+      - 所有物体: 用3D表面积最大的帧生成mesh (形状最完整)
+      - 动态物体: 位置摆在初始看见的位置 (首帧位置)
+      - 静态物体: 位置与生成帧一致 (无需额外调整)
+
+    动态/静态判断:
+      1. 逐帧中位数位移 (捕捉渐变漂移)
+      2. 全局位移: 首20%帧 vs 末20%帧质心距离 (捕捉VGGT漂移平滑后的真实运动)
+      任一信号超过阈值即判定为动态
+
     Args:
         world_points: numpy array of shape (T, H, W, 3)
         instance_masks: list of dicts with 'frame_id' and 'mask'
         motion_threshold: median displacement threshold (meters) for dynamic classification
     Returns:
         (optimal_frame_id, is_dynamic, motion_info)
-        - optimal_frame_id: int
+        - optimal_frame_id: int (3D表面积最大的帧, 用于生成mesh)
         - is_dynamic: bool
         - motion_info: dict with median_disp, max_disp, global_disp, first_valid_frame, num_valid_frames
     '''
@@ -382,40 +382,7 @@ def get_optimal_view_frame_id(world_points, instance_masks, motion_threshold=0.0
         'num_valid_frames': num_valid_frames,
     }
 
-    if is_dynamic:
-        motion_onset_idx = 0
-        onset_threshold = max(motion_threshold * 3, 0.05)
-        for i, disp in enumerate(consecutive_disps):
-            if disp > onset_threshold:
-                motion_onset_idx = i
-                break
-
-        if global_disp > max(motion_threshold * 2, 0.04) and motion_onset_idx == 0:
-            n_search = max(1, num_valid_frames // 3)
-            for i in range(n_search, len(valid_centroids)):
-                disp_from_start = np.linalg.norm(valid_centroids[i][1] - head_mean)
-                if disp_from_start > max(motion_threshold * 3, 0.06):
-                    motion_onset_idx = i - 1
-                    break
-
-        pre_motion_frame_ids = [valid_centroids[j][0] for j in range(motion_onset_idx + 1)]
-
-        if pre_motion_frame_ids:
-            best_frame = -1
-            max_area = 0
-            for instance_mask in instance_masks:
-                if instance_mask['frame_id'] in pre_motion_frame_ids:
-                    area = compute_surface_area_from_pointmap(
-                        world_points[instance_mask['frame_id']], instance_mask['mask']
-                    )
-                    if area > max_area:
-                        max_area = area
-                        best_frame = instance_mask['frame_id']
-            if best_frame >= 0:
-                return best_frame, True, motion_info
-
-        return first_valid_frame, True, motion_info
-
+    # 所有物体: 选择3D表面积最大的帧 (用于生成mesh)
     optimal_frame_id = -1
     max_area = 0
     for instance_mask in instance_masks:
@@ -426,7 +393,11 @@ def get_optimal_view_frame_id(world_points, instance_masks, motion_threshold=0.0
         if area > max_area:
             max_area = area
             optimal_frame_id = frame_id
-    return optimal_frame_id, False, motion_info
+
+    if optimal_frame_id < 0:
+        optimal_frame_id = first_valid_frame
+
+    return optimal_frame_id, is_dynamic, motion_info
 
 def get_walls_info(world_points, wall_masks):
     '''

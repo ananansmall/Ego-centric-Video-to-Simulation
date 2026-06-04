@@ -504,6 +504,58 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
         vggt_prediction_results['extrinsics'],
     )
 
+    # 动态物体: 位置调整到首次可见帧 (用最大帧生成mesh, 但位置摆在每个实例初始被SAM3检测到的位置)
+    for category, category_masks in deduplicated_all_masks.items():
+        for inst_idx, (instance_masks, instance_info) in enumerate(zip(category_masks, all_instances[category])):
+            optimal_frame_id = all_optimal_frame_ids[category][inst_idx]
+
+            sorted_masks = sorted(instance_masks, key=lambda im: im['frame_id'])
+            first_visible_frame_id = sorted_masks[0]['frame_id']
+
+            centroid_data = []
+            for im in sorted_masks:
+                fid = im['frame_id']
+                mask = im['mask']
+                pointmap = vggt_prediction_results['world_points'][fid]
+                valid = mask > 0
+                if not np.any(valid):
+                    continue
+                pts = pointmap[valid]
+                finite = np.all(np.isfinite(pts), axis=-1)
+                if not np.any(finite):
+                    continue
+                centroid_data.append((fid, np.mean(pts[finite], axis=0)))
+
+            if len(centroid_data) < 2:
+                continue
+
+            disps = [np.linalg.norm(centroid_data[i][1] - centroid_data[i-1][1]) for i in range(1, len(centroid_data))]
+            median_disp = float(np.median(disps))
+            n_h = max(1, len(centroid_data) // 5)
+            head_mean = np.mean([c for _, c in centroid_data[:n_h]], axis=0)
+            tail_mean = np.mean([c for _, c in centroid_data[-n_h:]], axis=0)
+            global_disp = float(np.linalg.norm(tail_mean - head_mean))
+            is_dynamic_inst = median_disp > 0.02 or global_disp > max(0.04, 0.02 * 2)
+
+            if not is_dynamic_inst:
+                continue
+
+            first_visible_centroid = None
+            optimal_centroid = None
+            for fid, c in centroid_data:
+                if fid == first_visible_frame_id and first_visible_centroid is None:
+                    first_visible_centroid = c
+                if fid == optimal_frame_id:
+                    optimal_centroid = c
+
+            if first_visible_centroid is not None and optimal_centroid is not None and first_visible_frame_id != optimal_frame_id:
+                offset = first_visible_centroid - optimal_centroid
+                if np.linalg.norm(offset) > 0.01:
+                    T = instance_info["T"].copy()
+                    T[:3, 3] += offset
+                    instance_info["T"] = T
+                    print(f"   {category}_{inst_idx}: [DYNAMIC] 位置调整: mesh帧{optimal_frame_id} → 首次可见帧{first_visible_frame_id}, offset={np.linalg.norm(offset):.4f}m", flush=True)
+
     # Stage 3.5: 多票验证生成的3D资产
     from tools.asset_verifier import verify_all_instances
     all_instances = verify_all_instances(
@@ -682,20 +734,21 @@ def run_stage5(output_path, categories_and_relations, all_instances,
         else:
             print("\n   📍 5.1: 无 'supported by other objects' 关系，跳过细化", flush=True)
 
-    # ── 5.2: 几何精修 (始终使用 sp_refinement.py 方式) ──
+    # ── 5.2: 几何精修 (只修改 "supported by <物体>" 的物体, 已精修的floor/wall不动) ──
     has_inter_object = any(
         rel.startswith("supported by ") and "floor" not in rel and "other objects" not in rel
         for rel in refined_relations.values()
     )
 
     if has_inter_object:
-        print("\n   📍 5.2: 物体间支撑关系空间位置精修", flush=True)
+        print("\n   📍 5.2: 物体间支撑关系空间位置精修 (只修改other objects物体)", flush=True)
         from tools.refine_inter_object_placement import refine_inter_object_relations
         all_instances = refine_inter_object_relations(
             all_instances, refined_relations,
             walls_info=walls_info, verbose=True,
             vlm_checkpoint=vlm_checkpoint,
             scene_dir=output_path,
+            only_refine_other_objects=True,
         )
     else:
         print("\n   📍 5.2: 无物体间支撑关系，跳过精修", flush=True)
@@ -839,6 +892,9 @@ def main(args):
                 extrinsic = vggt_prediction_results['extrinsics'][optimal_frame_id]
                 camera_pos = -extrinsic[:3, :3].T @ extrinsic[:3, 3]
                 instance_info = refine_attached_to_wall_object(instance_info, walls_info, camera_pos)
+            elif relationship == "held by hand":
+                print(f"  跳过精修: {category}_{instance_id} → held by hand (保持VGGT位置)", flush=True)
+                continue
             else:
                 continue
             category_instances[instance_id] = instance_info
@@ -865,7 +921,7 @@ def main(args):
             walls_info=walls_info,
         )
         from tools.refine_inter_object_placement import resolve_penetrations
-        all_instances = resolve_penetrations(all_instances, categories_and_relations, verbose=True)
+        all_instances = resolve_penetrations(all_instances, categories_and_relations, verbose=True, dry_run=True)
         save_final_glb(all_instances, args.output_path, "final_scene_stage4.glb")
         import pickle as _pkl
         s4_pkl_path = os.path.join(args.output_path, "all_instances_stage4.pkl")
@@ -896,6 +952,30 @@ def main(args):
     # 保存最终关系JSON
     with open(os.path.join(args.output_path, "final_relations.json"), 'w') as f:
         json.dump(refined_relations, f, indent=2, ensure_ascii=False)
+
+    # 保存位姿变化JSON (每个物体从Stage3到最终的位置历史)
+    pose_history = {}
+    for category, category_instances in all_instances.items():
+        for inst_idx, info in enumerate(category_instances):
+            key = f"{category}_{inst_idx}"
+            T = info["T"]
+            mesh = info["original_mesh"]
+            transformed = mesh.copy()
+            transformed.apply_transform(T)
+            pose_history[key] = {
+                "category": category,
+                "instance_idx": inst_idx,
+                "relation": refined_relations.get(category, "unknown"),
+                "T_matrix": T.tolist(),
+                "position": T[:3, 3].tolist(),
+                "bounds_min": transformed.bounds[0].tolist(),
+                "bounds_max": transformed.bounds[1].tolist(),
+                "center": transformed.bounds.mean(axis=0).tolist(),
+            }
+    pose_path = os.path.join(args.output_path, "pose_changes.json")
+    with open(pose_path, 'w') as f:
+        json.dump(pose_history, f, indent=2, ensure_ascii=False)
+    print(f"💾 位姿变化已保存: {pose_path}", flush=True)
 
     # 确定最终GLB路径用于日志输出
     if args.enable_stage4 and args.enable_stage5:

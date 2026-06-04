@@ -989,8 +989,8 @@ def _check_mesh_penetration(mesh_a, mesh_b, n_samples=500):
 
 
 def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
-                         categories_and_relations=None):
-    """全局穿模解决: 检测并修复所有物体对之间的穿模
+                         categories_and_relations=None, dry_run=False):
+    """全局穿模检测与解决
 
     策略:
       1. 对每对物体先用AABB快速排除，再用顶点采样精确检测穿模
@@ -1002,11 +1002,13 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
         all_instances: {category: [instance_info, ...]}
         refined_relations: 关系字典，用于判断谁是被支撑物（优先移动）
         verbose: 是否打印详细信息
+        dry_run: 如果为True, 只检测和警告, 不实际修改T矩阵
     返回:
         更新后的 all_instances
     """
     if verbose:
-        print("\n🛡️ 全局穿模检测与解决...", flush=True)
+        mode_str = " (仅检测, 不修改)" if dry_run else ""
+        print(f"\n🛡️ 全局穿模检测与解决{mode_str}...", flush=True)
 
     supported_names = set()
     floor_names = set()
@@ -1037,8 +1039,9 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
             mesh = _get_transformed_mesh(info)
             all_meshes.append((category, idx, mesh, info))
 
-    max_iterations = 1
-    for iteration in range(max_iterations):
+    penetration_warnings = []
+    max_iterations = 0 if dry_run else 1
+    for iteration in range(max(1, max_iterations)):
         any_resolved = False
 
         for i in range(len(all_meshes)):
@@ -1062,6 +1065,19 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
                 cat_j_is_wall = cat_j.lower().strip() in wall_names
 
                 if (cat_i_is_floor or cat_i_is_wall) and (cat_j_is_floor or cat_j_is_wall):
+                    continue
+
+                pair_desc = f"{cat_i}_{idx_i} ↔ {cat_j}_{idx_j}"
+                axis_name = ['x', 'y', 'z'][sep_axis]
+
+                if dry_run:
+                    penetration_warnings.append({
+                        "pair": pair_desc,
+                        "axis": axis_name,
+                        "depth": round(float(pen_depth), 4),
+                    })
+                    if verbose:
+                        print(f"      ⚠️ 穿模警告: {pair_desc} | {axis_name}轴 穿模深度 {pen_depth:.4f}m", flush=True)
                     continue
 
                 if cat_i_is_supported and not cat_j_is_supported:
@@ -1115,15 +1131,21 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
 
                 any_resolved = True
                 if verbose:
-                    pair_desc = f"{cat_i}_{idx_i} ↔ {cat_j}_{idx_j}"
-                    axis_name = ['x', 'y', 'z'][sep_axis]
                     print(f"      🔧 穿模修复: {pair_desc} | {axis_name}轴分离 {sep_dist:.4f}m", flush=True)
 
-        if not any_resolved:
+        if not dry_run and not any_resolved:
+            break
+        if dry_run:
             break
 
     if verbose:
-        print(f"   ✅ 穿模检测完成 (迭代{iteration + 1}次)", flush=True)
+        if dry_run:
+            if penetration_warnings:
+                print(f"   ⚠️ 检测到 {len(penetration_warnings)} 处穿模 (未自动修复, 请检查 pose_changes.json)", flush=True)
+            else:
+                print(f"   ✅ 无穿模", flush=True)
+        else:
+            print(f"   ✅ 穿模检测完成 (迭代{iteration + 1}次)", flush=True)
 
     return all_instances
 
@@ -1131,7 +1153,8 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
 def refine_inter_object_relations(all_instances, refined_relations,
                                   walls_info=None, verbose=True,
                                   vlm_checkpoint=None, scene_dir=None,
-                                  categories_and_relations=None):
+                                  categories_and_relations=None,
+                                  only_refine_other_objects=False):
     """
     主函数: 精修物体间支撑关系的空间位置
 
@@ -1147,6 +1170,8 @@ def refine_inter_object_relations(all_instances, refined_relations,
         verbose: 是否打印详细信息
         vlm_checkpoint: VLM模型路径（可选）
         scene_dir: 场景输出目录（如 outputs/232，包含 optimal_frames/ 和 keyframes/）
+        only_refine_other_objects: 只精修 "supported by other objects" 的物体,
+                                   已精修的 floor/wall 不动
     返回:
         更新后的 all_instances
     """

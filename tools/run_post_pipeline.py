@@ -7,10 +7,8 @@
 
 三个独立功能, 可任意组合调用:
   1. Stage 4:  视觉-空间对齐 (ICP + MASt3R)
-  2. Stage 5.1: 关系推断 (两种方式, --stage5_method 选择)
-     - scene_graph: SimRecon风格, ID标注图一次性推断所有关系 (默认, 推荐)
-     - per_object:  逐物体推断, 只细化 "supported by other objects" (旧方式)
-  3. Stage 5.2: SP 空间位置精修 (纯几何, 使用 sp_refinement.py)
+  2. Stage 5.1: 细化 "supported by other objects" 关系 (VLM)
+  3. Stage 5.2: SP 空间位置精修 (纯几何)
 
 数据流:
   final_scene.glb (Stage3产物)
@@ -464,55 +462,38 @@ def run_stage4(scene_dir, vggt_data, all_instances, args):
     return all_instances
 
 
-def run_refine_relations(scene_dir, stage1_json, files, vlm_checkpoint,
-                         stage5_method="scene_graph", categories_and_relations=None):
-    """Stage 5.1: 关系推断
-
-    两种方式:
-      scene_graph: SimRecon风格, 在ID标注图上一次性推断所有关系 (默认, 推荐)
-      per_object:  逐物体推断, 只细化 "supported by other objects" (旧方式)
+def run_refine_relations(scene_dir, stage1_json, files, vlm_checkpoint):
+    """Stage 5.1: 细化 "supported by other objects" 关系
 
     输入: stage1 JSON + optimal_frames + keyframes
     输出: refined JSON
     """
     print("\n" + "=" * 70, flush=True)
-    print(f"🚀 Stage 5.1: 关系推断 [method={stage5_method}]", flush=True)
+    print("🚀 Stage 5.1: 细化关系", flush=True)
     print("=" * 70, flush=True)
 
     if not vlm_checkpoint:
-        print("❌ 需要 VLM 模型才能推断关系", flush=True)
+        print("❌ 需要 VLM 模型才能细化关系", flush=True)
         return None
 
-    if stage5_method == "scene_graph":
-        from tools.infer_relations_scene_graph import infer_relations_scene_graph
-        if categories_and_relations is None:
-            with open(stage1_json, 'r') as f:
-                categories_and_relations = json.load(f)
-        refined_relations = infer_relations_scene_graph(
-            scene_dir=scene_dir,
-            vlm_checkpoint=vlm_checkpoint,
-            categories_and_relations=categories_and_relations,
-            output_dir=scene_dir,
-        )
-    else:
-        scene_id = files['scene_id']
-        refined_json = os.path.join(scene_dir, f"{scene_id}_refined.json")
+    scene_id = files['scene_id']
+    refined_json = os.path.join(scene_dir, f"{scene_id}_refined.json")
 
-        from tools.refine_other_objects_relations import refine_other_objects_relations
-        refined_relations = refine_other_objects_relations(
-            stage1_json_path=stage1_json,
-            output_json_path=refined_json,
-            scene_dir=scene_dir,
-            vlm_checkpoint=vlm_checkpoint,
-            optimal_frames_dir=files.get('optimal_frames_dir'),
-            keyframes_dir=files.get('keyframes_dir'),
-        )
+    from tools.refine_other_objects_relations import refine_other_objects_relations
+    refined_relations = refine_other_objects_relations(
+        stage1_json_path=stage1_json,
+        output_json_path=refined_json,
+        scene_dir=scene_dir,
+        vlm_checkpoint=vlm_checkpoint,
+        optimal_frames_dir=files.get('optimal_frames_dir'),
+        keyframes_dir=files.get('keyframes_dir'),
+    )
 
     final_rel = os.path.join(scene_dir, "final_relations.json")
     with open(final_rel, 'w') as f:
         json.dump(refined_relations, f, indent=2, ensure_ascii=False)
 
-    print(f"✅ Stage 5.1 完成", flush=True)
+    print(f"✅ Stage 5.1 完成 → {refined_json}", flush=True)
     print(f"   关系: {json.dumps(refined_relations, ensure_ascii=False)}", flush=True)
     return refined_relations
 
@@ -669,11 +650,8 @@ def main(args):
         print("\n⏭️  Stage 4 已跳过", flush=True)
 
     if do_stage5:
-        stage5_method = getattr(args, 'stage5_method', 'scene_graph')
         refined_relations = run_refine_relations(
-            scene_dir, files['stage1_json'], files, vlm_checkpoint,
-            stage5_method=stage5_method,
-            categories_and_relations=categories_and_relations,
+            scene_dir, files['stage1_json'], files, vlm_checkpoint
         )
         if refined_relations is None:
             refined_relations = dict(categories_and_relations)
@@ -743,11 +721,7 @@ if __name__ == "__main__":
                         help="启用 Stage 4 视觉-空间对齐")
 
     parser.add_argument("--stage5", action="store_true",
-                        help="启用 Stage 5 语义精修 (5.1 关系推断 + 5.2 SP精修)")
-
-    parser.add_argument("--stage5_method", type=str, default="scene_graph",
-                        choices=["scene_graph", "per_object"],
-                        help="Stage5.1关系推断方式: scene_graph(SimRecon风格,默认) | per_object(逐物体推断)")
+                        help="启用 Stage 5 语义精修 (5.1 细化关系 + 5.2 SP精修)")
 
     parser.add_argument("--only_refine_relations", action="store_true",
                         help="只运行 Stage 5.1: 细化关系")

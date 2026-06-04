@@ -300,3 +300,132 @@ Stage5 (run_post_pipeline.py) 从GLB加载3D资产时存在两个严重bug:
     - 8.3 main.py vs mainv2.py 在3D摆放上的关键差异
 
 - **CHANGE_LOG.md**: 合并原 CHANGES.md 内容，统一变更记录文件
+
+---
+
+## [2026-06-03] - 修复Stage5 scene_graph逻辑 + Stage1帧数对齐
+
+### Changed
+- tools/infer_relations_scene_graph.py:
+  - convert_scene_graph_to_relations() 核心规则修复:
+    1. 只修改 "supported by other objects" 的物体关系
+    2. 已确定的关系 (floor/wall/embedded/attached) 不改变
+    3. VLM判断不出具体关系时保持原样 "supported by other objects"
+- tools/generate_scene_json_stage1.py:
+  - 新增 --vggt_max_frames 参数 (默认160), 控制VGGT 3D重建帧数
+  - VGGT帧数不再硬编码160, 改为从参数读取
+- mainv2.py:
+  - run_stage1() 新增 vggt_max_frames 参数, 传递 --max_frames (Stage2的VGGT帧数) 到 Stage1
+  - Stage1 和 Stage2 的 VGGT 帧数现在保持一致
+- docs/mainv2_technical_doc.md:
+  - 9.3 scene_graph方式新增"核心规则"说明, 强调只修改 "other objects" 关系
+
+---
+
+## [2026-06-03] - mainv2 完整调整模式改进
+
+### Added
+- tools/infer_relations_scene_graph.py: SimRecon风格的场景图关系推断工具
+  - create_id_labeled_image(): 在帧图像上为每个可见实例绘制ID标注(绿色边框+红色编号)
+  - select_best_frame_for_labeling(): 选择显示最多物体的帧
+  - infer_relations_from_scene_graph(): 使用SimRecon风格VLM prompt推断关系
+  - parse_scene_graph_output(): 解析VLM输出为场景图JSON
+  - post_process_scene_graph(): 物理常识后处理(柜子不应挂在墙等)
+  - convert_scene_graph_to_relations(): 将场景图转换为ReplicateAnyScene格式
+  - infer_relations_scene_graph(): 完整推断流程(创建标注图→VLM推断→格式转换)
+
+### Changed
+- mainv2.py:
+  - GLB命名规则改为按Stage命名: final_scene.glb(基础) / final_scene_stage4.glb / final_scene_stage5.glb / final_scene_stage4_5.glb
+  - Stage4后保存 all_instances_stage4.pkl 和 final_scene_stage4.glb
+  - run_stage5()新增参数: deduplicated_all_masks, stage5_method
+  - Stage5.1关系推断新增scene_graph方式(SimRecon风格,默认), 保留per_object旧方式
+  - 新增 --stage5_method 命令行参数 (scene_graph|per_object)
+  - main()中Stage5逻辑改为调用run_stage5()函数
+  - 文件头注释更新: GLB命名说明、参数总览、使用方式示例
+- tools/run_post_pipeline.py:
+  - run_refine_relations()新增参数: stage5_method, categories_and_relations
+  - 支持scene_graph方式的关系推断
+  - 新增 --stage5_method 命令行参数
+  - 文件头注释更新: Stage5.1两种方式说明
+- docs/mainv2_technical_doc.md:
+  - 新增第九章"mainv2完整调整模式", 包含:
+    - 9.1 流水线总览(完整流程图)
+    - 9.2 最优视角帧选取:动静态策略(判断信号/动态策略/静态策略)
+    - 9.3 Stage5关系推断:两种方式(scene_graph vs per_object对比)
+    - 9.4 Stage5.2几何精修(sp_refinement.py方式)
+    - 9.5 GLB命名规则(按Stage命名+数据流图)
+    - 9.6 后处理管线(run_post_pipeline.py使用方式)
+    - 9.7 完整命令行参数
+  - 8.3对比表新增GLB命名和关系推断两行
+
+### ⚠️ Docs to Review
+- 无需额外同步, mainv2_technical_doc.md 已完整更新
+
+---
+
+## [2026-06-03] - object_tracking 管线清理与修复
+
+### Changed
+
+- **object_tracking/run_pipeline.py**: 修复 import 错误（旧代码使用 `from point_tracker import ...` 但文件已改名为 `02_point_tracker.py`），改用 `importlib.util.spec_from_file_location` 加载数字开头文件；新增 Step 0 GLB-视频对齐自动执行；步骤编号修正为 Step 0~4
+- **object_tracking/01_glb_video_align.py**: 删除死代码 `extract_extrinsics_from_hawor()` 和 `--hawor_npz` 参数（该分支只打印警告就 return）；修复帧计数 bug（`frame_indices.index(i)` → `enumerate`）；简化 `main()` 只保留 `--extrinsics_dir` 路径
+- **object_tracking/02_point_tracker.py**: 删除 `sample_query_points_from_sam3_mask()` 函数（SAM3 不是本管线的一部分）；简化 `run_point_tracking()` 签名，移除 `object_masks` 参数
+- **object_tracking/__init__.py**: 新增 `load_extrinsics_from_dir` 和 `load_intrinsic` 导出
+- **object_tracking/simulation/run_simulation.py**: 修正 docstring 中对已删除 `action_semantics` 的引用，改为 `grasp_controller`
+- **object_tracking/USAGE.md**: 重写为完整管线文档，步骤编号统一为 Step 0~4，新增管线输出目录结构说明
+
+### Removed
+
+- `CHANGES.md`: 内容已合并到 CHANGE_LOG.md
+
+### ⚠️ Docs to Review
+
+- `docs/MERGE_ARCHITECTURE.md`: 管线步骤编号从 Step 0~5 改为 Step 0~4，需同步更新
+
+---
+
+## [2026-06-03 18:40] - 将 ReplicateAnyScene 作为 submodule 上传到 Ego-Video-to-SIM
+
+### Changed
+
+- **.gitignore**: 扩展排除规则，新增排除大文件类型（*.pt, *.ckpt, *.safetensors, *.pth, *.bin, *.onnx, *.h5, *.ply, *.glb, *.gltf, *.obj, *.stl, *.fbx）和大目录（output_v2/, models/, assets/, hand_removal/, stage4/），以及 object_tracking/test_output/
+
+### Added
+
+- 将 ReplicateAnyScene 全部代码文件（62个文件，约296KB）推送到独立仓库 `git@github.com:ananansmall/Ego-centric-Video-to-Simulation.git`
+- 在 `Ego-Video-to-SIM` 仓库中添加 ReplicateAnyScene 为 git submodule（路径: `ReplicateAnyScene/`，指向 `Ego-centric-Video-to-Simulation` 仓库）
+
+### 排除的大文件/目录
+
+| 目录/文件类型 | 大小 | 排除原因 |
+|---|---|---|
+| models/ | 16G | 模型权重文件 |
+| output_v2/ | 2.3G | 输出数据（图片、深度图、点云、3D场景） |
+| assets/ | 3.3G | 资源文件 |
+| outputs/ | 2.9G | 输出数据 |
+| sam3/ | 76M | 子模块 |
+| vggt/ | 64M | 子模块 |
+| sam-3d-objects/ | 225M | 子模块 |
+
+---
+
+## [2026-06-03 22:00] - 添加 HaWoR 为 submodule + 更新 ReplicateAnyScene + 生成使用指南
+
+### Added
+
+- 在 `Ego-Video-to-SIM` 仓库中添加 HaWoR 为 git submodule（路径: `HaWoR/`，指向上游 `ThunderVVV/HaWoR` 仓库）
+- 在 `Ego-Video-to-SIM` 仓库中添加 `SUBMODULE_GUIDE.md`，包含完整的 submodule 使用指南：
+  - 克隆仓库（含子模块）
+  - 子模块的日常操作（拉取更新、修改代码、推送）
+  - 完整工作流示例（修改代码、部署、添加/删除子模块）
+  - 常见问题排查
+  - 大文件处理说明
+  - 调用关系图
+
+### Changed
+
+- **ReplicateAnyScene**: 推送最新代码到远程仓库（13个文件更新，包括 mainv2.py、object_tracking/、tools/、docs/ 等）
+- **Ego-Video-to-SIM**: 更新 ReplicateAnyScene 子模块引用到最新 commit (b888cc4)
+
+---

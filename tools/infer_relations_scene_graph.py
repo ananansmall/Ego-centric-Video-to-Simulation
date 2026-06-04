@@ -239,26 +239,38 @@ Think about what objects are ATTACHED TO WALL (hanging/fixed on vertical surface
 - ONLY these types: picture, painting, photo frame, mirror, clock, poster, whiteboard, TV (wall-mounted), window, door, curtain rod, light switch, outlet
 - Curtains are attached to wall (via curtain rod)
 
+### Step 4: Identify HELD objects (held by hand)
+Think about what objects are BEING HELD BY A PERSON'S HAND:
+- Tools: hammer, scissors, screwdriver, wrench, knife
+- Small handheld items: phone, remote, pen, cup (when held), bottle
+- Toys being played with
+- If an object is clearly in someone's hand (not resting on any surface), mark it as "held"
+- parent=0 for held objects (no spatial parent)
+
 ## PHYSICAL COMMON SENSE RULES:
 1. **Cabinets, wardrobes, bookshelves** → ALWAYS supported by floor (parent=1), NOT attached to wall!
 2. **Tables, desks, chairs, beds** → ALWAYS supported by floor (parent=1)
 3. **Wall-attached** is RARE, only for: pictures, mirrors, clocks, posters, wall-mounted TVs, curtains, windows, doors
 4. **Objects on furniture** → parent is that furniture's ID, relation is "support"
 5. **Small items on desk** (lamp, monitor, keyboard, cup) → supported by desk
+6. **Objects held by hand** → relation="held", parent=0. Do NOT place them on floor or table!
+7. **If an object is floating in mid-air** (not on any surface), it is likely being held → relation="held", parent=0
 
 ## OUTPUT FORMAT:
 ```json
 {{
   "objects": [
-    {{"id": <display_id>, "category": "<name>", "relation": "support|attached", "parent": <parent_id>}}
+    {{"id": <display_id>, "category": "<name>", "relation": "support|attached|held", "parent": <parent_id>}}
   ]
 }}
 ```
+Where parent_id: 0=held by hand, 1=floor, 2=wall, or another object's display_id.
 
 ## CRITICAL REQUIREMENTS:
 - You MUST output exactly {num_objects} objects (one for each ID: {display_ids_str})
 - Do NOT skip any object!
-- If unsure, default to: relation="support", parent=1 (floor)
+- If an object is being held by a hand, use relation="held", parent=0
+- If unsure and the object appears to be resting on a surface, default to: relation="support", parent=1 (floor)
 
 Now analyze the image and output the complete JSON with all {num_objects} objects.
 '''
@@ -417,7 +429,9 @@ def convert_scene_graph_to_relations(
         if original_relations.get(category) != "supported by other objects":
             continue
 
-        if parent_id == 1 and relation == 'support':
+        if parent_id == 0 and relation == 'held':
+            refined_relations[category] = "held by hand"
+        elif parent_id == 1 and relation == 'support':
             refined_relations[category] = "supported by floor"
         elif parent_id == 2 and relation == 'attached':
             cat_lower = category.lower()
