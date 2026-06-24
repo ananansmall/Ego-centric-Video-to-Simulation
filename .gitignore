@@ -42,7 +42,10 @@ outputs/
 models/
 assets/
 hand_removal/
-stage4/
+
+# stage4: only exclude large output, keep code
+stage4/output/
+stage4/__pycache__/
 
 # Submodule directories
 sam-3d-objects/

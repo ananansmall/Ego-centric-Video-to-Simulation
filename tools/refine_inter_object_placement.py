@@ -605,28 +605,111 @@ def _align_upright(info):
     return info
 
 
-def sp_refine_on_top(supported_info, supporter_info, max_offset=0.3, initial_offset=None):
+def _judge_refinement_degree_with_vlm(vlm_model, vlm_processor, image,
+                                       object_name, supporter_name,
+                                       max_new_tokens=64):
+    """用VLM判断物体放置的精修程度.
+
+    根据图像中物体与支撑物的关系, 判断需要大精修还是小精修:
+    - major: 物体明显穿入支撑物内部或位置严重偏离
+    - minor: 物体接近正确位置, 只需微调
+    - correct: 物体已正确放置, 无需调整
+
+    Args:
+        vlm_model: 已加载的VLM模型
+        vlm_processor: VLM processor
+        image: PIL.Image 或 numpy array (H, W, 3) RGB
+        object_name: 被支撑物体名称
+        supporter_name: 支撑物名称
+        max_new_tokens: 最大输出token数
+
+    Returns:
+        str: "major" / "minor" / "correct"
+    """
+    try:
+        from PIL import Image as PILImage
+        if isinstance(image, np.ndarray):
+            image = PILImage.fromarray(image)
+
+        prompt = (
+            f"Look at the {object_name} and {supporter_name} in this image.\n"
+            f"Is the {object_name} correctly resting on top of the {supporter_name}?\n\n"
+            f"Answer with ONE word:\n"
+            f"- major: the {object_name} is deeply embedded inside the {supporter_name}, "
+            f"or far from the correct position\n"
+            f"- minor: the {object_name} is close to correct but slightly off "
+            f"(floating or slightly embedded)\n"
+            f"- correct: the {object_name} is correctly resting on the {supporter_name}\n\n"
+            f"Answer:"
+        )
+
+        result = _vlm_inference(image, vlm_model, vlm_processor, prompt,
+                                max_new_tokens=max_new_tokens)
+        result = result.strip().lower()
+
+        if "major" in result:
+            return "major"
+        elif "minor" in result:
+            return "minor"
+        elif "correct" in result:
+            return "correct"
+        else:
+            # 无法解析, 默认 minor
+            return "minor"
+    except Exception as e:
+        print(f"      ⚠️ VLM精修程度判断失败: {e}, 默认 minor", flush=True)
+        return "minor"
+
+
+def _compute_penetration_depth(supported_info, supporter_info):
+    """计算物体与支撑物的穿模深度 (z轴方向).
+
+    Returns:
+        float: 穿模深度 (m), 正值表示穿入, 0表示无穿模
+    """
+    supported_mesh = _get_transformed_mesh(supported_info)
+    supporter_mesh = _get_transformed_mesh(supporter_info)
+
+    supported_bottom_z = supported_mesh.bounds[0, 2]
+    supporter_top_z = supporter_mesh.bounds[1, 2]
+
+    # 穿模深度: 物体底部在支撑物顶部以下多少
+    penetration = supporter_top_z - supported_bottom_z
+    return max(0.0, penetration)
+
+
+def sp_refine_on_top(supported_info, supporter_info, max_offset=0.3, initial_offset=None,
+                     refinement_degree=None):
     """supported底面贴supporter顶面 (只做z轴对齐)
 
-    只做z轴平移，不做旋转对齐，不做xy约束。
+    大精修 / 小精修 分级策略:
+      - refinement_degree="major": 大精修 — 物体严重穿入支撑物
+        始终执行完整 z 轴贴合 (移动到支撑物顶面)
+      - refinement_degree="minor": 小精修 — 物体接近正确位置
+        执行 z 轴贴合, 但限制最大移动距离为 0.15m (避免过度调整)
+      - refinement_degree="correct": 不调整
+      - refinement_degree=None: 默认行为, 始终执行完整 z 轴贴合
 
-    设计哲学:
-      - VLM 已经判定物体在支撑物上方 (on_top), 所以始终执行 z 轴贴合
-      - 不再有 0.3m 阈值限制 — 旧版阈值导致物体卡在桌子内部无法移出
-      - z_offset = supporter_top_z - supported_bottom_z
-        正值: 物体在支撑物下方或穿入，向上推
-        负值: 物体悬空在支撑物上方，向下落
-        接近0: 已接触，无需调整
+    z_offset = supporter_top_z - supported_bottom_z
+    正值: 物体在支撑物下方或穿入，向上推
+    负值: 物体悬空在支撑物上方，向下落
+    接近0: 已接触，无需调整
 
     Args:
         supported_info: 被支撑物体的信息字典，含 original_mesh 和 T
         supporter_info: 支撑物体的信息字典，含 original_mesh 和 T
-        max_offset: (已废弃, 保留参数兼容) 不再限制偏移量
+        max_offset: (已废弃, 保留参数兼容)
         initial_offset: (已废弃, 保留参数兼容)
+        refinement_degree: VLM判断的精修程度 "major"/"minor"/"correct"/None
 
     Returns:
         dict: T矩阵已更新的 supported_info
     """
+    # correct: 不调整
+    if refinement_degree == "correct":
+        print(f"      [on_top] VLM判定 correct, 无需调整", flush=True)
+        return supported_info
+
     old_pos = supported_info["T"][:3, 3].copy()
 
     supported_info = _align_upright(supported_info)
@@ -645,8 +728,22 @@ def sp_refine_on_top(supported_info, supporter_info, max_offset=0.3, initial_off
     if abs(z_offset) < 1e-6:
         return supported_info
 
-    # 始终执行 z 轴贴合 (VLM 已判定 on_top, 无需阈值判断)
-    reason = f"z_offset={z_offset:+.4f}m, 贴合支撑物顶面"
+    # 根据精修程度决定调整策略
+    if refinement_degree == "minor":
+        # 小精修: 限制最大移动距离, 避免过度调整
+        max_minor_move = 0.15
+        if abs(z_offset) > max_minor_move:
+            # 超过小精修范围, 截断到最大距离
+            z_offset = max_minor_move if z_offset > 0 else -max_minor_move
+            print(f"      [on_top] 小精修: z_offset截断到 {z_offset:+.4f}m", flush=True)
+        else:
+            print(f"      [on_top] 小精修: z_offset={z_offset:+.4f}m", flush=True)
+    elif refinement_degree == "major":
+        # 大精修: 始终执行完整 z 轴贴合
+        print(f"      [on_top] 大精修: z_offset={z_offset:+.4f}m, 完整贴合", flush=True)
+    else:
+        # 默认 (无VLM判断): 始终执行完整 z 轴贴合
+        print(f"      [on_top] z_offset={z_offset:+.4f}m, 贴合支撑物顶面", flush=True)
 
     # 应用 z 轴平移
     translation_vector = np.array([0, 0, z_offset])
@@ -1665,12 +1762,9 @@ def refine_inter_object_relations(all_instances, refined_relations,
             if verbose:
                 print(f"   {supported_name}: {best_strategy} — {desc} (VLM)", flush=True)
 
-        import torch
-        import gc
-        del vlm_model, vlm_processor
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # 不卸载VLM, 保留用于SP精修程度判断
+        if verbose:
+            print(f"   ℹ️ VLM保留加载, 用于SP精修程度判断", flush=True)
     else:
         if verbose:
             print(f"\n📐 放置策略（规则回退，默认 on_top）:", flush=True)
@@ -1680,6 +1774,8 @@ def refine_inter_object_relations(all_instances, refined_relations,
             desc = PLACEMENT_STRATEGIES.get(strategy, "")
             if verbose:
                 print(f"   {supported_name}: {strategy} — {desc}", flush=True)
+        vlm_model = None
+        vlm_processor = None
 
     # ── SP精修 (按依赖排序: 支撑物先处理) ──
     if verbose:
@@ -1748,15 +1844,50 @@ def refine_inter_object_relations(all_instances, refined_relations,
                         print(f"      ⚠️  initial_offset 计算失败: {e}", flush=True)
                     initial_offset = None
 
+            # VLM判断精修程度 (大精修/小精修/正确)
+            refinement_degree = None
+            if vlm_model is not None and strategy == "on_top":
+                # 加载该物体的最优帧图像
+                _optimal_frame_path = None
+                _optimal_dir = os.path.join(scene_dir, "optimal_frames") if scene_dir else None
+                if _optimal_dir and os.path.isdir(_optimal_dir):
+                    # 查找匹配该类别的帧
+                    for _fname in sorted(os.listdir(_optimal_dir)):
+                        if supported_cat.lower() in _fname.lower() or supported_name.lower() in _fname.lower():
+                            _optimal_frame_path = os.path.join(_optimal_dir, _fname)
+                            break
+                    # 回退: 取第一张帧
+                    if _optimal_frame_path is None:
+                        _all_frames = sorted(os.listdir(_optimal_dir))
+                        if _all_frames:
+                            _optimal_frame_path = os.path.join(_optimal_dir, _all_frames[0])
+
+                if _optimal_frame_path and os.path.isfile(_optimal_frame_path):
+                    try:
+                        from PIL import Image as PILImage
+                        _img = PILImage.open(_optimal_frame_path).convert("RGB")
+                        refinement_degree = _judge_refinement_degree_with_vlm(
+                            vlm_model, vlm_processor, _img,
+                            supported_name, supporter_name
+                        )
+                        if verbose:
+                            print(f"      📊 VLM精修程度: {refinement_degree}", flush=True)
+                    except Exception as e:
+                        if verbose:
+                            print(f"      ⚠️ VLM精修程度判断失败: {e}", flush=True)
+                        refinement_degree = None
+
             try:
                 if strategy in ("against_side", "leaning"):
                     supported_instances[inst_idx] = sp_refine_fn(
                         supported_info, supporter_info, walls_info
                     )
                 else:
-                    # on_top/inside: 用 initial_offset 判断, 只在基本正确时微调
+                    # on_top/inside: 传入 refinement_degree
                     supported_instances[inst_idx] = sp_refine_fn(
-                        supported_info, supporter_info, max_offset=0.3, initial_offset=initial_offset
+                        supported_info, supporter_info,
+                        max_offset=0.3, initial_offset=initial_offset,
+                        refinement_degree=refinement_degree
                     )
             except Exception as e:
                 if verbose:
@@ -1820,6 +1951,18 @@ def refine_inter_object_relations(all_instances, refined_relations,
 
     if verbose:
         print(f"\n✅ 物体间关系精修完成!", flush=True)
+
+    # 卸载VLM
+    if vlm_model is not None:
+        try:
+            import torch
+            import gc
+            del vlm_model, vlm_processor
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     return all_instances
 

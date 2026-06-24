@@ -8,19 +8,21 @@
   - 便于对比各阶段位姿变化
   - 调试 SP精修/穿模修复效果
 
+GLB 命名与 mainv2.py 完全一致:
+  initial          → final_scene_initial.glb
+  basic_refinement → final_scene.glb
+  stage4           → final_scene_stage4.glb
+  stage5           → final_scene_stage5.glb (无stage4时)
+                   或 final_scene_stage4_5.glb (有stage4时)
+
 输入:
   - all_instances.pkl (含 original_mesh)
   - pose_changes.json (含各阶段 T_matrix)
 
-输出:
-  - rebuild_initial.glb
-  - rebuild_basic_refinement.glb
-  - rebuild_stage4.glb (如有)
-  - rebuild_stage5.glb (如有)
-
 用法:
   python tools/rebuild_glbs_from_json.py --scene_dir output_v2/121_xxx
   python tools/rebuild_glbs_from_json.py --scene_dir output_v2/121_xxx --stage stage5
+  python tools/rebuild_glbs_from_json.py --scene_dir output_v2/121_xxx --has_stage4
 """
 import argparse
 import json
@@ -39,6 +41,14 @@ ZUP_TO_YUP = np.array([
     [0, -1, 0, 0],
     [0, 0, 0, 1],
 ])
+
+# 阶段名 → mainv2.py 中的 GLB 文件名映射
+STAGE_TO_GLB = {
+    "initial": "final_scene_initial.glb",
+    "basic_refinement": "final_scene.glb",
+    "stage4": "final_scene_stage4.glb",
+    # stage5 的文件名取决于是否有 stage4, 在 main() 中动态决定
+}
 
 
 def load_all_instances(pkl_path):
@@ -59,16 +69,6 @@ def load_pose_changes(json_path):
 def apply_T_and_save_glb(all_instances, pose_data, stage_name, output_path, filename):
     """根据 pose_data 中指定阶段的 T_matrix 重建 GLB"""
     scene = trimesh.Scene()
-
-    # 添加虚拟水平面标注
-    grid_lines = []
-    grid_range = 5.0
-    grid_step = 0.5
-    for v in np.arange(-grid_range, grid_range + grid_step, grid_step):
-        grid_lines.append(trimesh.load_path(np.array([[v, -grid_range, 0], [v, grid_range, 0]])))
-        grid_lines.append(trimesh.load_path(np.array([[-grid_range, v, 0], [grid_range, v, 0]])))
-    grid = trimesh.util.concatenate(grid_lines)
-    scene.add_geometry(grid, node_name="grid_z0")
 
     count = 0
     for category, instances in all_instances.items():
@@ -100,8 +100,8 @@ def main():
                         help="场景输出目录")
     parser.add_argument("--stage", type=str, default=None,
                         help="只重建指定阶段 (initial/basic_refinement/stage4/stage5), 默认全部")
-    parser.add_argument("--prefix", type=str, default="rebuild_",
-                        help="输出文件前缀 (默认: rebuild_)")
+    parser.add_argument("--has_stage4", action="store_true",
+                        help="标记有stage4 (影响stage5的GLB命名: final_scene_stage4_5.glb)")
     args = parser.parse_args()
 
     pkl_path = os.path.join(args.scene_dir, "all_instances.pkl")
@@ -127,6 +127,15 @@ def main():
     available_stages = list(pose_data[sample_key]["stages"].keys())
     print(f"   可用阶段: {available_stages}", flush=True)
 
+    # 自动检测是否有 stage4
+    has_stage4 = args.has_stage4 or "stage4" in available_stages
+
+    # 构建 stage5 的文件名
+    if has_stage4:
+        STAGE_TO_GLB["stage5"] = "final_scene_stage4_5.glb"
+    else:
+        STAGE_TO_GLB["stage5"] = "final_scene_stage5.glb"
+
     # 过滤阶段
     stages_to_rebuild = [args.stage] if args.stage else available_stages
     for s in stages_to_rebuild:
@@ -134,14 +143,18 @@ def main():
             print(f"⚠️  阶段 '{s}' 不在 pose_changes.json 中, 跳过", flush=True)
             continue
 
-    print(f"\n🔧 重建 GLB...", flush=True)
+    print(f"\n🔧 重建 GLB (命名与 mainv2.py 一致)...", flush=True)
     for stage in stages_to_rebuild:
         if stage not in available_stages:
             continue
-        filename = f"{args.prefix}{stage}.glb"
+        filename = STAGE_TO_GLB.get(stage, f"final_scene_{stage}.glb")
         apply_T_and_save_glb(all_instances, pose_data, stage, args.scene_dir, filename)
 
     print(f"\n✅ 完成! 输出目录: {args.scene_dir}", flush=True)
+    print(f"\n📋 GLB 命名对照:", flush=True)
+    for stage, glb_name in STAGE_TO_GLB.items():
+        if stage in available_stages:
+            print(f"   {stage:20s} → {glb_name}", flush=True)
 
 
 if __name__ == "__main__":
