@@ -1,6 +1,7 @@
 # mainv2.py 完整技术文档
 
 > 整合时间: 2026-06-02
+> 最近更新: 2026-06-18 (同步默认值变更、修复状态更新)
 > 涵盖: mainv2 vs main 差异、新增模块逻辑、常见问题与解答
 
 ---
@@ -11,6 +12,7 @@
 2. [mainv2 vs main: 逐阶段对比](#2-逐阶段对比)
 3. [新增模块详解](#3-新增模块详解)
 4. [GLB文件体系](#4-glb文件体系)
+4.1. [位姿变化记录 pose_changes.json](#41-位姿变化记录-pose_changesjson)
 5. [动态物体检测](#5-动态物体检测)
 6. [SP精修逻辑](#6-sp精修逻辑)
 7. [后处理管线 run_post_pipeline.py](#7-后处理管线)
@@ -43,7 +45,8 @@ mainv2.py (无 --enable_stage4/5):
   等价于 main.py 的完整流程
 
 mainv2.py (--enable_stage4 --enable_stage5):
-  Stage1 → Stage2 → Stage3 → 基础精修 → Stage4 → Stage5 → final_scene.glb
+  Stage1 → Stage2 → Stage3 → 基础精修 → Stage4 → Stage5 → final_scene_stage4_5.glb
+  (生成 5 个 GLB, 详见 §4 GLB文件体系)
 ```
 
 ---
@@ -56,10 +59,10 @@ mainv2.py (--enable_stage4 --enable_stage5):
 |---|---------|-----------|
 | 方式 | 手动 `--category_path` | 自动 subprocess 调用 `generate_scene_json_stage1` |
 | VLM | 不需要 | Qwen3.5-9B / Qwen2.5-VL-3B (自动回退) |
-| 关键帧 | 无 | 贪心采样10帧 + `keyframes_metadata.json` |
+| 关键帧 | 无 | 贪心采样12帧 + `keyframes_metadata.json` |
 | 关系格式 | `supported_by_floor` (下划线) | 兼容下划线和空格 |
 | 代码位置 | `with open(args.category_path, 'r') as f:` | `run_stage1()` 函数，subprocess调用 |
-| 输入参数 | `--category_path` (必须) | `--input_video` (必须), `--max_frames_stage1` (默认10) |
+| 输入参数 | `--category_path` (必须) | `--input_video` (必须), `--max_frames_stage1` (默认12) |
 | 输出文件 | 无 | `scene_{id}_stage1.json` + `keyframes/` |
 
 ### Stage 2: 3D重建 + 去重
@@ -71,8 +74,8 @@ mainv2.py (--enable_stage4 --enable_stage5):
 | 帧加载 | `load_video_frames(video, max_frames)` | vggt/vggt4d: `load_video_frames`; vggt_omega: `load_vggt_omega_frames` |
 | 图像分辨率 | 518 (patch_size=14) | vggt/vggt4d: 518; vggt_omega: 512 (patch_size=16) |
 | 预测函数 | `vggt_predict(frames, model)` | `vggt_predict` / `vggt_omega_predict` / `vggt4d_predict` |
-| protected_categories | **无** | **新增**: 传入Stage1 JSON类别名，防止跨类合并 |
-| 跨类去重调用 | `cross_category_deduplicate(all_masks, pts, conf)` | `cross_category_deduplicate(all_masks, pts, conf, protected_categories=...)` |
+| protected_categories | **无** | **白名单过滤**: 跨类去重后，只保留Stage1 JSON中存在的类别 (`json_categories_set`)，过滤掉SAM3误检的类别 |
+| 跨类去重调用 | `cross_category_deduplicate(all_masks, pts, conf)` | `cross_category_deduplicate(all_masks, pts, conf)` + 白名单过滤 |
 | 代码位置 | 平铺在main()中 | `run_stage2()` 函数 |
 
 **关键差异: VGGT模型选择**
@@ -103,6 +106,34 @@ elif vggt_model_type == "vggt4d":
 **关键差异: VGGT-Omega 分辨率不同**
 
 VGGT-Omega 使用 patch_size=16, image_resolution=512，而 VGGT/VGGT4D 使用 patch_size=14, image_resolution=518。每个模型必须用自己的 `load_*_frames` 函数，不能用 `ReplicateAnyScene` 的 `load_video_frames`。
+
+**关键差异: Stage 2 四阶段 Z 轴对齐 (新增)**
+
+`run_stage2()` 在 SAM3 分割 floor/wall 后，按以下优先级逐级尝试对齐到房间坐标系，只有当前阶段失败才进入下一阶段：
+
+| 阶段 | 函数 | 输入 | 成功条件 |
+|------|------|------|---------|
+| 1 | `align_to_room_coordinate_system` | SAM3 `floor`/`wall` 文本提示 mask | 同时存在有效 floor 和正交 wall 平面 |
+| 2 | `align_via_objects` | 放宽阈值的 floor (+ wall 或点云 PCA) | 存在有效 floor 平面 |
+| 2.5 | `align_via_vlm_floor_points` | VLM 地面参考点 + SAM3 `box` prompt | VLM 返回有效点且 SAM3 分割出 floor |
+| 3 | `align_via_large_plane` | SAM3 大平面 mask (`flat surface`/`ground`/`horizontal surface`) | 存在有效大平面 |
+| 4 | `align_via_geocalib` | GeoCalib 重力估计 | 至少一帧重力估计成功且内点足够 |
+
+```python
+R, t = align_to_room_coordinate_system(world_points, wall_masks, floor_masks)
+if _is_identity_alignment(R, t):
+    R, t, info = align_via_objects(world_points, wall_masks, floor_masks)
+    if _is_identity_alignment(R, t):
+        # 2.5 VLM + SAM3 box prompt
+        R, t, info = align_via_vlm_floor_points(...)
+        if _is_identity_alignment(R, t):
+            large_plane_masks = segment_large_flat_surfaces(...)
+            R, t, info = align_via_large_plane(world_points, large_plane_masks)
+            if _is_identity_alignment(R, t):
+                R, t, info = align_via_geocalib(images, world_points)
+```
+
+**关于 SAM3 点提示**: `sam3/model/sam3_image_processor.py` 中的 `Sam3Processor` 只暴露了 `add_geometric_prompt(box=..., label=...)`，没有公开的点提示 API。底层 `FindStage` 虽然预留了 `input_points`/`input_points_mask` 字段，但图像推理封装未开放。因此阶段 2.5 采用 **VLM 生成地面参考点 + 围绕点构造小 box** 的方式来近似点提示。
 
 ### Stage 3: 资产生成
 
@@ -198,7 +229,7 @@ for instance_id, (optimal_frame_id, instance_info) in enumerate(zip(...)):
 | 打印语言 | 英文 | 中文 |
 | 注释掉的代码 | 含大段注释的替代3D资产生成代码 (Inference类) | 已移除 |
 | VLM模型查找 | 无 | `_resolve_vlm_checkpoint()` 自动查找 (Qwen3.5-9B → Qwen2.5-VL-3B) |
-| Stage5逻辑 | 注释占位 | `run_stage5()` 函数已定义，但 `main()` 中未调用，Stage5逻辑在 `main()` 内L843-885重新实现 |
+| Stage5逻辑 | 注释占位 | `run_stage5()` 函数已定义并在 `main()` 中调用，`main()` 内只负责 GLB 命名与 pose 记录 |
 | 输入验证 | 仅检查文件存在 | 互斥验证 + 目录检查 + 自动统一为input_video |
 
 **关键差异: `--category_path` 已移除**
@@ -242,9 +273,9 @@ def _resolve_vlm_checkpoint():
     # 找不到时 sys.exit(1)
 ```
 
-**关键差异: Stage5 逻辑重复**
+**关键差异: Stage5 逻辑统一**
 
-`run_stage5()` 函数 (L620-676) 已定义，但 `main()` 中未调用。Stage5 的实际逻辑在 `main()` 内 L843-885 重新实现。`run_stage5()` 可能供 `run_post_pipeline.py` 使用。
+`run_stage5()` 函数已统一封装 5.1 关系细化与 5.2 SP 精修逻辑，`main()` 直接调用并负责最终 GLB 命名与 `pose_changes.json` 记录。
 
 ---
 
@@ -305,13 +336,134 @@ def _resolve_vlm_checkpoint():
 
 ## 4. GLB文件体系
 
-### 文件说明
+### GLB 生成流程图 (核心)
 
-| 文件 | 生成时机 | 说明 |
-|------|---------|------|
-| `final_scene_base.glb` | 基础精修后 | **固定起点**，供 `run_post_pipeline.py` 使用，不再更改 |
-| `final_scene.glb` | 管线结束时 | **始终为最新结果**，不启用stage4/5时等同base |
-| `all_instances.pkl` | 基础精修后 | 实例数据字典，供后处理管线独立调用 |
+`all_instances` 是贯穿全流程的核心数据结构。每个阶段修改它，然后保存一个 GLB 快照。
+
+```
+Stage1 (物体发现)
+    │  输出: categories_and_relations (JSON)
+    ▼
+Stage2 (3D重建 + Z轴对齐 + SAM3去重)
+    │  修改: vggt_prediction_results (对齐R,t)
+    │  输出: world_points, colors, extrinsics, point_cloud.ply
+    ▼
+Stage3 (最优视角资产生成)
+    │  修改: all_instances = {category: [instance_info, ...]}
+    │        每个 instance_info 含 original_mesh + T矩阵
+    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  save_final_glb(all_instances, "final_scene_initial.glb")       │
+│  ► GLB #1: Stage3原始结果, 未做任何精修                          │
+│  ► 代码: mainv2.py L1111                                        │
+│  ► 数据来源: all_instances (Stage3刚生成)                        │
+└─────────────────────────────────────────────────────────────────┘
+    │
+    ▼  基础精修 (floor/wall/embedded, 始终执行)
+       修改: all_instances 中每个物体的 T 矩阵
+       (refine_supported_by_floor / refine_embedded_in_wall / refine_attached_to_wall)
+┌─────────────────────────────────────────────────────────────────┐
+│  save_final_glb(all_instances, "final_scene.glb")               │
+│  ► GLB #2: 基础精修后结果 (固定起点)                             │
+│  ► 代码: mainv2.py L1138                                        │
+│  ► 数据来源: all_instances (基础精修后)                          │
+│  ► 同时保存: all_instances.pkl (供 run_post_pipeline.py 使用)    │
+└─────────────────────────────────────────────────────────────────┘
+    │
+    ▼  --enable_stage4?
+    │
+    ├── YES ──► Stage4 (迭代视觉-空间对齐)
+    │           修改: all_instances (ICP对齐 + resolve_penetrations)
+    │           ┌─────────────────────────────────────────────────┐
+    │           │ save_final_glb(all_instances,                   │
+    │           │   "final_scene_stage4.glb")                     │
+    │           │ ► GLB #3: Stage4对齐后结果                      │
+    │           │ ► 代码: mainv2.py L1167                         │
+    │           │ ► 数据来源: all_instances (Stage4后)             │
+    │           │ ► 同时保存: all_instances_stage4.pkl             │
+    │           └─────────────────────────────────────────────────┘
+    │
+    ▼  --enable_stage5?
+    │
+    ├── YES ──► Stage5 (高级语义精修)
+    │           │
+    │           ├── 5.1: 关系推断 (scene_graph / per_object)
+    │           │       修改: refined_relations (不修改 all_instances)
+    │           │
+    │           ├── 5.2: SP精修 (有物体间关系时)
+    │           │       修改: all_instances (on_top/inside/against_side)
+    │           │       + resolve_penetrations (穿模修复)
+    │           │       ┌────────────────────────────────────────┐
+    │           │       │ 保存: "final_scene_stage5_sp.glb"      │
+    │           │       │ ► GLB #4: SP精修+穿模修复后中间结果     │
+    │           │       │ ► 代码: refine_inter_object_placement  │
+    │           │       │       .py L1793                        │
+    │           │       │ ► 数据来源: all_instances (SP精修后)    │
+    │           │       └────────────────────────────────────────┘
+    │           │
+    │           └── check_stability (稳定性检查)
+    │               修改: all_instances (旋转对齐+z贴合+悬空修复)
+    │               ┌────────────────────────────────────────────┐
+    │               │ 保存: final_glb_name                       │
+    │               │   有stage4 → "final_scene_stage4_5.glb"    │
+    │               │   无stage4 → "final_scene_stage5.glb"      │
+    │               │ ► GLB #5 (或#4无stage4时): 最终结果        │
+    │               │ ► 代码: refine_inter_object_placement      │
+    │               │       .py L1822                            │
+    │               │ ► 数据来源: all_instances (check_stability)│
+    │               └────────────────────────────────────────────┘
+    │
+    │           (无物体间关系时, 5.2跳过, mainv2.py L1199 兜底保存)
+    │
+    ▼
+结束: 输出最终GLB路径 + pose_changes.json + z_axis_alignment.json
+```
+
+### GLB 文件数量 (按启用阶段)
+
+| 启用阶段 | 生成文件 | 总数 |
+|---------|---------|------|
+| 默认 (无 stage4/5) | `final_scene_initial.glb`, `final_scene.glb` | 2 |
+| 仅 `--enable_stage5` | + `final_scene_stage5_sp.glb`*, `final_scene_stage5.glb` | 4* |
+| 仅 `--enable_stage4` | + `final_scene_stage4.glb` | 3 |
+| `--enable_stage4 --enable_stage5` | + `final_scene_stage4.glb`, `final_scene_stage5_sp.glb`*, `final_scene_stage4_5.glb` | 5* |
+
+> *`final_scene_stage5_sp.glb` 仅在有物体间支撑关系时生成。无物体间关系时 5.2 跳过，总数减 1。
+
+### 各 GLB 详细说明
+
+| GLB | 保存位置 | 保存时机 | 数据来源 | 坐标系 |
+|-----|---------|---------|---------|--------|
+| `final_scene_initial.glb` | mainv2.py L1111 | Stage3 完成后、基础精修前 | all_instances (Stage3原始) | y-up |
+| `final_scene.glb` | mainv2.py L1138 | 基础精修 (floor/wall/embedded) 后 | all_instances (基础精修后) | y-up |
+| `final_scene_stage4.glb` | mainv2.py L1167 | Stage4 视觉-空间对齐后 | all_instances (Stage4后) | y-up |
+| `final_scene_stage5_sp.glb` | refine_inter_object_placement.py L1793 | Stage5 SP精修+穿模修复后 | all_instances (SP精修后) | y-up |
+| `final_scene_stage5.glb` | refine_inter_object_placement.py L1822 / mainv2.py L1199 | 仅Stage5、check_stability后 | all_instances (check_stability后) | y-up |
+| `final_scene_stage4_5.glb` | refine_inter_object_placement.py L1822 / mainv2.py L1199 | Stage4+Stage5全部后处理后 | all_instances (check_stability后) | y-up |
+
+### GLB 传递关系 (谁根据谁生成)
+
+```
+all_instances (内存中的核心数据)
+    │
+    ├─ Stage3完成 ──► final_scene_initial.glb  (快照#1)
+    │
+    ├─ 基础精修 ────► final_scene.glb          (快照#2, 固定起点)
+    │                 + all_instances.pkl      (pkl快照, 供独立后处理)
+    │
+    ├─ Stage4 ──────► final_scene_stage4.glb   (快照#3)
+    │                 + all_instances_stage4.pkl
+    │
+    └─ Stage5 ──────► final_scene_stage5_sp.glb  (快照#4, 中间结果)
+                      final_scene_stage5.glb      (快照#4最终, 无stage4)
+                      final_scene_stage4_5.glb    (快照#5最终, 有stage4)
+```
+
+**关键点**:
+- 每个 GLB 都是 `all_instances` 在某个时间点的**快照**
+- `all_instances` 在内存中被各阶段**就地修改** (T矩阵变化)
+- GLB 之间**不相互依赖** — 都直接从 `all_instances` 生成
+- `all_instances.pkl` 是 `all_instances` 的 pickle 快照, 供 `run_post_pipeline.py` 独立重跑 Stage4/5
 
 ### pkl数据结构
 
@@ -324,15 +476,77 @@ def _resolve_vlm_checkpoint():
 }
 ```
 
-### 为什么需要 final_scene_base.glb？
+### --cleanup 参数 (新增)
 
-`run_post_pipeline.py` 需要一个**固定起点**来执行stage4/5。如果直接用`final_scene.glb`，重复运行时可能已经包含了之前stage4/5的修改，导致叠加错误。`final_scene_base.glb`始终是基础精修的结果，不受stage4/5影响。
+启用 `--cleanup` 后，流水线结束时自动删除中间文件：
+
+| 删除的文件 | 说明 |
+|-----------|------|
+| `all_instances.pkl` | 基础精修后pkl (382M+) |
+| `all_instances_stage4.pkl` | Stage4后pkl |
+| `color/` | VGGT输入帧 (160张jpg) |
+| `depth/` | VGGT深度图 (160张png) |
+| `extrinsics/` | 相机外参 |
+| `keyframes/` | Stage1关键帧 |
+| `optimal_frames/` | Stage3最优视角帧 |
+
+**保留的文件**: 所有 `.glb`, `.ply`, `.json`, `.log`, `intrinsic.txt`
 
 ### GLB坐标系
 
 - **内部处理**: z-up (与`sp_refinement.py`、`geometry_utils.py`一致)
 - **GLB输出**: y-up (trimesh标准)
-- **变换**: 保存时执行 z-up → y-up 变换
+- **变换**: 保存时执行 z-up → y-up 变换 (仅作用于临时 Scene 对象, 不回写 all_instances)
+
+### Stage5 是否改变坐标系？
+
+**不改变。** Stage5 的所有操作都是**单个物体的 T 矩阵微调**, 不存在全局坐标系变换:
+
+| 操作 | 代码位置 | 类型 |
+|------|---------|------|
+| SP精修 (on_top/inside/against_side等) | refine_inter_object_placement.py L608-869 | 单个物体: 旋转对齐+z贴合 |
+| `_align_upright` | refine_inter_object_placement.py L590-605 | 单个物体: 旋转对齐 (当前已禁用) |
+| `resolve_penetrations` | refine_inter_object_placement.py L1110-1278 | 单个物体: 沿分离轴推开 |
+| `check_stability` Phase 1-4 | refine_inter_object_placement.py L1281-1504 | 单个物体: 旋转对齐+z贴合+悬空修复 |
+
+**唯一的全局坐标系变换发生在 Stage2** (`align_to_room_coordinate_system` + `align_vggt_predictions`), 将 VGGT 原始预测对齐到房间坐标系。Stage5 只在此基础上微调各物体的位姿。
+
+**用户观察到"不同GLB之间z轴变化"的原因**: 不是坐标系变了, 而是各阶段精修改变了物体的 T 矩阵, 导致物体在场景中的朝向和位置不同。例如:
+- `final_scene_initial.glb`: 物体可能严重倾斜 (Stage2对齐失败时)
+- `final_scene.glb`: 基础精修做了旋转对齐, 物体更竖直
+- `final_scene_stage5_sp.glb`: SP精修进一步调整了物体位置
+- `final_scene_stage5.glb`: check_stability 确保物体稳定
+
+---
+
+## 4.1 位姿变化记录 `pose_changes.json`
+
+每个物体在各阶段的位姿会被记录到 `pose_changes.json`，便于追溯和调试：
+
+```json
+{
+  "table_0": {
+    "category": "table",
+    "instance_idx": 0,
+    "relation": "supported by floor",
+    "stages": {
+      "initial": { "T_matrix": [...], "position": [...], "bounds_min": [...], ... },
+      "basic_refinement": { "T_matrix": [...], "position": [...], "delta_from_initial": [...] },
+      "stage4": { "T_matrix": [...], "position": [...], "delta_from_basic_refinement": [...] },
+      "stage5": { "T_matrix": [...], "position": [...], "delta_from_stage4": [...] }
+    }
+  }
+}
+```
+
+**记录规则**:
+- `initial`: Stage3 完成后、基础精修前
+- `basic_refinement`: 基础精修 (floor/wall/embedded) 后
+- `stage4`: 仅当启用 `--enable_stage4` 时记录
+- `stage5`: 仅当启用 `--enable_stage5` 时记录
+- `physics`: 仅当启用 `--enable_physics_validation` 时记录
+
+**向后兼容**: 不启用 Stage4 时，`pose_changes.json` 中不会出现 `stage4` 键，代码通过 `args.enable_stage4` 条件判断，不会出现 KeyError。
 
 ---
 
@@ -477,12 +691,12 @@ Step 2: supported顶面对齐到supporter底面
   ├── optimal_frames/     → 最优帧图像
   ├── keyframes/          → 关键帧
   ├── intrinsic.txt       → 内参
-  ├── final_scene_base.glb → 基础精修GLB (固定起点)
+  ├── final_scene.glb     → 基础精修GLB (固定起点)
   ├── all_instances.pkl   → 实例数据
   └── scene_*_stage1.json → Stage1 JSON
 ```
 
-**GLB发现优先级**: `final_scene_base.glb` > `final_scene.glb`
+**GLB发现优先级**: `final_scene.glb` > `final_scene_base.glb` (兼容旧版)
 
 **调用方式**:
 ```bash
@@ -498,23 +712,27 @@ python tools/run_post_pipeline.py output_v2/hoi4d --stage4 --stage5
 
 **数据流**:
 ```
-final_scene_base.glb (固定起点)
-  → Stage4 → final_scene.glb (覆盖)
-  → Stage5 → final_scene.glb (覆盖)
+all_instances.pkl (基础精修后快照)
+  → Stage4 → final_scene_stage4.glb
+  → Stage5 → final_scene_stage5.glb / final_scene_stage4_5.glb
 ```
 
 ---
 
 ## 8. 常见问题
 
-### Q1: 为什么有3个GLB文件？
+### Q1: 为什么有不同数量的 GLB 文件？
 
-| 文件 | 说明 |
-|------|------|
-| `final_scene_base.glb` | 基础精修后保存，**固定起点**，不再更改 |
-| `final_scene.glb` | 最终结果，始终为最新 |
+GLB 数量取决于启用的阶段：
 
-旧版代码曾保存 `final_scene_stage4.glb` 等中间文件，已移除。现在只有2个GLB。
+| 启用阶段 | 文件 | 数量 |
+|---------|------|------|
+| 默认 | `final_scene_initial.glb`, `final_scene.glb` | 2 |
+| `--enable_stage5` | + `final_scene_stage5_sp.glb`, `final_scene_stage5.glb` | 4 |
+| `--enable_stage4` | + `final_scene_stage4.glb` | 3 |
+| `--enable_stage4 --enable_stage5` | + `final_scene_stage4.glb`, `final_scene_stage5_sp.glb`, `final_scene_stage4_5.glb` | 5 |
+
+`final_scene_base.glb` 仍作为 `run_post_pipeline.py` 的固定起点保留，但 `mainv2.py` 默认流程中不再生成（由 `final_scene.glb` 替代）。
 
 ### Q2: 为什么所有物体都被判为静态？
 
@@ -566,6 +784,174 @@ final_scene_base.glb (固定起点)
 
 但在SP精修中，`_align_upright` 只做旋转对齐，不做z轴判断，z轴平移由各策略函数自己控制。
 
+### Q8: Stage1 能不能加快速度？用 vggt_omega 行吗？还是 VLM 判断慢？
+
+**结论：VGGT 3D重建是绝对瓶颈（~45%时间），VLM推理是第二大耗时（~30%时间）。**
+
+Stage1 各步骤时间占比：
+
+| 步骤 | 描述 | 时间占比 | 说明 |
+|------|------|---------|------|
+| Step 0 | VGGT 3D重建 | **~45%** | 120帧 × VGGT-1B完整前向推理 |
+| Step 3 | 第一次VLM：物体检测 | **~18%** | 12帧逐帧VLM推理 |
+| Step 6 | SAM分割floor/wall | **~12%** | SAM3模型加载+推理 |
+| Step 7 | 第二次VLM：关系判断 | **~12%** | 12帧逐帧VLM推理 |
+| Step 5.5 | 点云补充检测 | **~6%** | DBSCAN + ≤5次VLM |
+| 其他 | 采样/帧提取/去重/射线投射 | **~7%** | 纯CPU/IO操作 |
+
+**能否用 vggt_omega 替代？**
+
+当前 Stage1 硬编码使用原版 VGGT（`generate_scene_json_stage1.py` 没有 `--vggt_model` 参数）。VGGT-Omega 推理速度可能快10-20%，但存在关键风险：
+
+- VGGT-Omega 的 `depth_conf` 分布太均匀，百分位阈值无法有效区分可靠/不可靠点，导致**点云缺块**
+- Stage1 的射线投射和3D覆盖采样高度依赖点云质量
+- 缺块的点云会导致射线投射失败率升高、采样覆盖率下降
+
+**不建议替换**。更好的加速方案是减少 `--vggt_max_frames`（如从120降到80），能直接减少近一半VGGT推理时间。
+
+**VLM调用详情**：Stage1 共3类VLM调用，总计最多29次：
+- 物体检测(Step3): 12次，完整帧输入，短prompt
+- 补充检测(Step5.5): ≤5次，裁剪图输入，短prompt
+- 关系判断(Step7): ≤12次，完整帧输入，长prompt
+
+### Q9: 坐标系问题——点云和GLB的原点/坐标轴会有明显偏差吗？为什么会出现倒立？找不到地面就用相机吗？
+
+**1. 点云和GLB的原点/坐标轴**
+
+点云 (`point_cloud.ply`) 和 GLB 确实有不同的坐标系：
+- 点云在 Room World 坐标系下（z-up，地板z=0，场景中心为原点）
+- GLB 在 glTF 标准坐标系下（y-up），导出时做了 `z-up → y-up` 变换
+
+两者之间是确定的轴变换关系，不会产生"偏差"，只是表示方式不同。
+
+**2. 为什么会出现倒立坐标轴？**
+
+倒立的根因在 `get_plane_info()` 中法线方向的确定逻辑不够鲁棒：
+
+```python
+# geometry_utils.py:193
+normal = -normal if normal[0] < 0 else normal  # 仅根据x分量正负翻转
+```
+
+这个逻辑只根据法线 x 分量的正负来决定翻转，而不是根据物理含义（地板法线应该朝上）。虽然后续有修正逻辑：
+
+```python
+# geometry_utils.py:255-257
+floor_to_wall_vector = wall_plane_info['centroid'] - floor_plane_info['centroid']
+if np.dot(floor_to_wall_vector, floor_normal) < 0:
+    floor_normal = -floor_normal
+```
+
+但这个修正**依赖墙面质心在地板上方的假设**。如果墙面分割不准确，或墙面质心恰好在地板下方，修正就会失败，导致 z 轴朝下 → 整个场景倒立。
+
+**3. 找不到地面时是否用相机？**
+
+**不会。** `align_to_room_coordinate_system` 在找不到地面时返回恒等变换：
+
+```python
+# geometry_utils.py:240-241
+if len(floor_plane_infos) == 0:
+    return np.eye(3), np.zeros(3)  # 不做任何变换，保留VGGT原始坐标系
+```
+
+没有回退到相机坐标的机制。mainv2 新增了三级坐标系后备方案（Level 1 → Level 1.5 → Level 2+3），详见 §9.9。
+
+### Q10: SAM3D放置的姿态对吗？动态物体帧生成和摆放位置分开了吗？
+
+**1. SAM3D的T矩阵是否正确？**
+
+T矩阵的变换链数学推导是正确的：
+
+```
+Local(SAM3D) ──y2z──→ Local(z-up) ──l2c──→ Camera(SAM3D) ──adjust──→ Camera(VGGT) ──ext⁻¹──→ World(VGGT)
+```
+
+但T矩阵的正确性**完全依赖于VGGT预测的extrinsic精度**。VGGT可能预测了正确的相对3D结构，但相机位置偏了，导致物体绝对位置偏移。
+
+**注意**：`_align_upright` 当前已被**禁用**（`refine_inter_object_placement.py:576-591`），函数体直接 `return info`。禁用原因是VGGT重建的物体朝向可能本身就不准确，强制旋转可能导致更差的结果。
+
+**2. 动态物体帧生成和摆放位置是否分开？**
+
+**是的，已部分分离。** 代码位于 `mainv2.py:507-557`：
+
+- **mesh生成帧**：`optimal_frame_id`（3D表面积最大的帧）→ SAM3D用该帧的image/mask/pointmap/extrinsic生成mesh
+- **放置位置帧**：`first_visible_frame_id`（首次被SAM3检测到的帧）→ 动态物体的T矩阵平移分量被调整到该帧的质心位置
+
+调整方式：
+```python
+offset = first_visible_centroid - optimal_centroid
+T[:3, 3] += offset  # 只调整平移分量，旋转不变
+```
+
+**重要限制**：
+1. 只修正了位置偏移，没有修正朝向偏移（如果动态物体在不同帧朝向不同）
+2. offset基于world_points的质心差，VGGT在动态区域的点云质量较差，质心本身可能有误差
+3. 理想情况下应该用first_visible_frame的extrinsic重新计算整个T矩阵，但这需要重新运行SAM3D（代价太大）
+
+### Q11: mask的给出是去重前还是去重后的？同一位置生成多个物体是去重的问题吗？和遮挡有关系吗？
+
+**1. 传给SAM3D的masks是去重后的**
+
+流水线中的数据流：
+
+```
+segment_and_track → category_masks (去重前)
+  ↓ self_category_deduplicate
+deduplicated_category_masks (类内去重后)
+  ↓ cross_category_deduplicate
+deduplicated_all_masks (跨类去重后)
+  ↓ 白名单过滤 (json_categories_set)
+filtered_masks (只保留Stage1发现的类别)
+  ↓ 传入 run_stage3 → generate_3d_asset_in_subprocess
+SAM3D接收去重后的masks
+  ↓ deduplicate_3d_assets
+3D Mesh级别二次去重
+```
+
+SAM3D接收的是经过**三层去重+白名单过滤**后的masks。
+
+**2. 同一位置生成多个物体——根因是遮挡导致的跟踪断裂**
+
+因果链：
+
+```
+手部遮挡/物体移动
+  → SAM3跟踪断裂（同一物体被分割为多个实例）
+  → self_category_deduplicate 尝试合并（基于3D点云重叠率）
+  → 如果物体移动了，原位置和新位置的3D点云重叠率可能不够高
+  → 合并失败 → 同一物体保留多个实例
+  → SAM3D为每个实例分别生成3D资产
+  → 同一位置（或相近位置）出现多个物体
+```
+
+| 场景 | 根因 | 去重能否解决 |
+|------|------|-------------|
+| 静态物体被遮挡后重新出现 | SAM3跟踪断裂，但3D位置不变 | **能** — 重叠率高，类内去重会合并 |
+| 动态物体移动后 | SAM3在新旧位置各检测一次 | **部分能** — 新旧位置重叠率≥0.3则合并 |
+| 同一物体被分为不同类别 | SAM3分割不一致 | **能** — 跨类去重+白名单过滤会处理 |
+
+**3. 和遮挡的关系**
+
+遮挡是间接原因。直接原因是SAM3在遮挡发生时跟踪断裂，导致同一物体被拆分为多个实例。去重机制（3D点云重叠率）可以部分修复，但对于移动过的物体，新旧位置重叠率不够高时无法合并。
+
+### Q12: SAM floor分割报错 "boolean index did not match" 是什么问题？
+
+**根因**：SAM对原图(如1080×W)分割的mask尺寸与VGGT输出的pointmap尺寸(如518×W_vggt)不同。`get_plane_info(pointmap, mask)` 中 `pointmap[mask]` 直接用大mask索引小pointmap导致维度不匹配。
+
+**修复**：新增 `_resize_mask_to_pointmap(mask, pointmap)` 辅助函数，在应用mask前将其resize到pointmap尺寸（PIL NEAREST插值保持bool语义）。修复了两处：
+1. `get_plane_info()` 调用前
+2. 点云补充检测排除floor区域时
+
+### Q13: 点云补充检测提取点数过少（如25个点）是什么原因？
+
+**根因**：置信度阈值比较用 `>` 严格大于。当某帧的中位数=最小值=1.000时，`conf_frame > 1.000` 排除了所有等于1.000的点（超过一半有效点）。
+
+**修复**：
+1. `>` 改为 `>=`，保留等于阈值的点
+2. 新增保底逻辑：如果过滤后点数<100，自动降低到25%分位数
+
+修复后，同样的帧（518个有效点，中位数=1.000）会保留约259个点而非25个。
+
 ---
 
 ## 9. 命令行参数
@@ -583,9 +969,9 @@ python mainv2.py --input_images <图片目录> [选项]
 | `--input_images` | str | None | 输入图片目录路径 (与--input_video二选一，必须指定其一) |
 | `--output_path` | str | None | 输出目录 (默认自动生成: `./output_v2/{video_stem}_{vggt_model}`) |
 | `--vlm_checkpoint` | str | None | VLM模型路径 (默认自动查找: Qwen3.5-9B → Qwen2.5-VL-3B) |
-| `--max_frames` | int | 160 | VGGT最大帧数 (Stage2) |
+| `--max_frames` | int | 120 | VGGT最大帧数 (Stage2) |
 | `--vggt_model` | str | "vggt" | 3D重建模型选择: `vggt` / `vggt_omega` / `vggt4d` |
-| `--max_frames_stage1` | int | 10 | Stage1采样关键帧数 |
+| `--max_frames_stage1` | int | 12 | Stage1采样关键帧数 |
 | `--enable_stage4` | flag | False | 启用Stage4视觉-空间对齐 |
 | `--enable_stage5` | flag | False | 启用Stage5语义感知场景精修 |
 | `--enable_vlm_dynamic` | flag | False | 启用VLM辅助动态检测 (加权投票) |
@@ -768,3 +1154,7 @@ python tools/run_post_pipeline.py ./output_v2/video_vggt_omega \
 | 2026-06-02 | pkl格式扩展为字典 | mainv2.py, run_post_pipeline.py |
 | 2026-06-03 | 补充遗漏差异: --category_path移除、--input_images互斥、输出路径自动生成、VLM自动查找、Stage5逻辑重复等 | mainv2_technical_doc.md |
 | 2026-06-03 | 补充完整参数调用示例: 各模型/Stage组合/后处理管线/参数组合速查 | mainv2_technical_doc.md |
+| 2026-06-18 | 默认帧数更新: max_frames 160→120, max_frames_stage1 10→12 | mainv2.py |
+| 2026-06-18 | 修复SAM floor分割mask维度不匹配: 新增_resize_mask_to_pointmap() | generate_scene_json_stage1.py |
+| 2026-06-18 | 修复点云补充检测阈值: >改>=, 点数<100自动降低阈值 | generate_scene_json_stage1.py |
+| 2026-06-18 | 更新技术文档: 同步默认值、更新protected_categories描述、新增Q8-Q13 | mainv2_technical_doc.md |
