@@ -1,112 +1,65 @@
-# ReplicateAnyScene 变更记录
+# Change Log
 
-所有项目变更的统一记录。包含原始修改文档和 Agent 自动追加的变更。
+项目变更记录。每次 Agent 任务完成后自动追加。
 
 ---
 
-## [2026-05-08] - 原始项目修改 (CHANGES.md 合并)
+## [2026-06-22] - 修复3个bug + Stage5坐标系审查 + 文档更新
 
-### 一、Stage 1: generate_scene_json_stage1_qwen36.py
+### 核心问题
+1. `motion_info['global_disp']` KeyError — motion_info 字典没有 global_disp key
+2. `spherical_mean(weights=...)` TypeError — 参数名应为 w
+3. `'refined_relations' in dir()` 脆弱判断 — 直接用 categories_and_relations
+4. 用户质疑 Stage5 是否改变了 GLB 坐标系
 
-**文件**: `tools/generate_scene_json_stage1_qwen36.py` (新建)
+### Changed
 
-基于原 `generate_scene_json_stage1.py` 适配 Qwen3.6-27B-FP8 模型。
+- **mainv2.py**: 删除 `motion_info['global_disp']` 引用 (L475)
+- **mainv2.py**: `'refined_relations' in dir()` → 直接用 `categories_and_relations` (L997)
+- **src/geometry_utils.py**: `spherical_mean(weights=inlier_confs)` → `spherical_mean(w=inlier_confs)` (L555)
+- **docs/mainv2_technical_doc.md**: 新增"四个GLB文件"表 + "Stage5是否改变坐标系"章节 (基于代码审查, 确认Stage5不改变坐标系)
 
-| 项目 | 原版 (Qwen2.5-VL-3B) | 新版 (Qwen3.6-27B-FP8) |
-|------|----------------------|------------------------|
-| 默认模型 | Qwen2.5-VL-3B-Instruct | Qwen3.6-27B-FP8 |
-| 图像预处理 | `qwen_vl_utils.process_vision_info` | 直接传 `images=` 给 processor |
-| 图片 resize | 手动 `resize((512,512))` | processor 内部处理 |
-| GPU 分配 | 固定 GPU 3 | `device_map="auto"` 自动分配 |
-| 推理函数 | 分散在各处 | 统一 `_vlm_inference()` |
+### 审查结论
+- Stage5 的所有操作都是单个物体的 T 矩阵微调, 不存在全局坐标系变换
+- 4个GLB文件之间没有坐标系差异 (全部 y-up), 区别仅在于各阶段精修导致的物体位姿不同
+- 唯一的全局坐标系变换发生在 Stage2
 
-**关键帧提取策略**:
-- 基于 VGGT 相机位姿变化（位移 + 旋转）
-- 累积位移 >= 0.1m 或累积转角 >= 5° 才选为新关键帧
-- 不强制补充均匀采样帧，VGGT 选几帧就几帧
-- 帧提取使用 ffmpeg 按时间戳提取，避免 cv2 seek 超时
+### Docs to Review
+- 无需额外同步
 
-**运行命令**:
-```bash
-/mnt/data/lza/conda_envs/ReplicateAnyScene/bin/python tools/generate_scene_json_stage1_qwen36.py \
-  --input_video assets/basic_pick_place/7.mp4 \
-  --num_frames 10
-```
+---
 
-### 二、main.py 修改
+## [2026-06-18] - 修复3个运行时问题 + 重写mainv2技术文档
 
-#### 2.1 VLM 幻觉验证（新增）
+### 核心问题
+1. mainv2.py默认帧数参数(10/160)未同步更新，导致print输出仍显示旧值
+2. SAM floor分割mask(1080xW)与VGGT pointmap(518xW_vggt)维度不匹配，boolean index报错
+3. 点云补充检测置信度阈值用`>`严格大于，当中位数=最小值时排除大量有效点
 
-**问题**: SAM3 纯文本提示分割会产生幻觉，在视频里没有的物体也被分割出 mask。
+### Changed
 
-**方案**: 在 `cross_category_deduplicate` 之后，加载 VLM 模型验证每个实例是否真实存在。
+- **mainv2.py**: 5处默认值同步更新
+  - `run_stage1()` 参数: `max_frames_stage1=10->12`, `vggt_max_frames=160->120`
+  - `run_stage2()` 参数: `max_frames=160->120`
+  - argparse `--max_frames`: `default=160->120`
+  - argparse `--max_frames_stage1`: `default=10->12`
+  - 顶部帮助文本同步更新
 
-**流程**:
-```
-SAM3 分割出 mask
-  → 裁剪 mask 区域的图像
-  → VLM 问 "Does this image contain a '{category}'?"
-  → 至少 2 帧回答 yes → 保留
-  → 否则 → 丢弃（幻觉过滤）
-```
+- **tools/generate_scene_json_stage1.py**: 3处修改
+  - 新增 `_resize_mask_to_pointmap(mask, pointmap)`: 将SAM mask resize到VGGT pointmap尺寸
+  - `get_plane_info()` 调用前使用 `_resize_mask_to_pointmap()` 对齐mask维度
+  - 点云补充检测排除floor区域时使用 `_resize_mask_to_pointmap()` 对齐mask维度
+  - 置信度阈值比较 `>` 改为 `>=`，避免排除等于阈值的点
+  - 新增保底逻辑：过滤后点数<100时自动降低到25%分位数
 
-**新增参数**: `--vlm_checkpoint`（默认自动检测 Qwen3.6-27B-FP8）
+- **docs/mainv2_technical_doc.md**: 在原有文档基础上更新
+  - 更新默认值: max_frames=120, max_frames_stage1=12
+  - 更新protected_categories描述: 改为白名单过滤实现
+  - 新增Q8-Q13: Stage1速度分析、坐标系问题、SAM3D姿态、mask去重流程、SAM维度修复、点云补充检测修复
+  - 新增修改记录条目
 
-**新增函数**: `src/object_segmentation.py` 中的 `verify_instance_with_vlm()`
-
-#### 2.2 运动物体选首次出现帧
-
-**问题**: 原逻辑选 3D 表面积最大的帧生成 GLB，但运动物体在被拿起/移动时面积最大，此时形状不完整。
-
-**方案**: 修改 `get_optimal_view_frame_id()` 的选帧策略：
-
-```
-计算每帧 mask 的 3D 质心
-  → 相邻帧质心位移 > 0.1m？ → 物体在运动 → 选首次出现的帧
-  → 位移都小？ → 物体静止 → 选面积最大的帧（原逻辑）
-```
-
-**修改文件**: `src/geometry_utils.py`
-
-**新增参数**: `motion_threshold=0.1`（质心位移阈值，单位：米）
-
-#### 2.3 cross_category_deduplicate 阈值调整
-
-**问题**: 原阈值 `< 3` 导致只在 1~2 帧出现的物体被丢弃，无法生成 GLB。
-
-**方案**: 阈值从 `< 3` 改为 `< 2`，只在 1 帧出现的实例才被丢弃。
-
-**修改文件**: `src/sg_deduplication.py` 第 321 行
-
-### 三、其他修改
-
-#### 3.1 ffmpeg 替代 cv2 提取帧
-
-**问题**: cv2 的 `cap.set(CAP_PROP_POS_FRAMES)` 在某些视频上会超时，导致提取 0 帧。
-
-**方案**: 全部改用 ffmpeg 按时间戳提取帧。
-
-**修改文件**: `tools/generate_scene_json_stage1.py` 中的 `extract_specific_frames()` 和 `extract_frames_from_video()`
-
-#### 3.2 VLM_PROMPT_LOCATE 花括号转义
-
-**问题**: Python `.format()` 把 JSON 中的 `{}` 当占位符，导致 KeyError。
-
-**方案**: JSON 中的 `{` `}` 改为 `{{` `}}` 转义。
-
-**修改文件**: `tools/generate_scene_json_stage1.py` 中的 `VLM_PROMPT_LOCATE`
-
-### 四、修改文件清单
-
-| 文件 | 修改类型 | 说明 |
-|------|----------|------|
-| `tools/generate_scene_json_stage1_qwen36.py` | 新建 | 适配 Qwen3.6-27B-FP8 的 Stage 1 |
-| `tools/test_qwen36.py` | 新建 | Qwen3.6-27B-FP8 加载测试脚本 |
-| `main.py` | 修改 | 加 VLM 幻觉验证 + `--vlm_checkpoint` 参数 |
-| `src/geometry_utils.py` | 修改 | `get_optimal_view_frame_id` 运动物体选首帧 |
-| `src/sg_deduplication.py` | 修改 | 阈值 `< 3` → `< 2` |
-| `src/object_segmentation.py` | 修改 | 新增 `verify_instance_with_vlm()` |
-| `tools/generate_scene_json_stage1.py` | 修改 | ffmpeg 提取帧 + 旋转角度 + 花括号转义 |
+### Docs to Review
+- 无需额外同步的.md文件
 
 ---
 
@@ -147,6 +100,9 @@ Stage5 (run_post_pipeline.py) 从GLB加载3D资产时存在两个严重bug:
 
 - **tools/__init__.py**: 空文件, 使tools目录可作为Python包导入, 修复ModuleNotFoundError
 
+### ⚠️ Docs to Review
+- 无需同步的.md文件(本次修改均为代码逻辑修复)
+
 ---
 
 ## [2026-05-31] - 修复hoi4d_vggt_omega三个核心问题: 投票帧不足/平票/实例丢失
@@ -180,6 +136,14 @@ Stage5 (run_post_pipeline.py) 从GLB加载3D资产时存在两个严重bug:
 ### Added
 
 - **output_v2/hoi4d_vggt_omega/README.md**: 完整的输出目录说明文档
+  - 文件说明 (最终输出/Stage1/2/3产物)
+  - 物体实例清单 (含VLM投票和SP精修结果)
+  - 问题分析及修复方案 (4个问题的因果链和修复方式)
+  - 修复文件清单
+
+### ⚠️ Docs to Review
+- `TECHNICAL_DOCUMENTATION.md`: `cross_category_deduplicate` 新增了 `protected_categories` 参数, 文档中该函数的描述需同步更新
+- `CHANGES.md`: 跨类去重保护机制是重要变更, 建议记录
 
 ---
 
@@ -204,6 +168,9 @@ Stage5 (run_post_pipeline.py) 从GLB加载3D资产时存在两个严重bug:
   - 新增功能 (日志系统、中间结果、异常处理)
   - 鲁棒性分析
 
+### ⚠️ Docs to Review
+- `TECHNICAL_DOCUMENTATION.md`: mainv2的Stage1/4/5新功能需要补充描述
+
 ---
 
 ## [2026-05-31] - VGGT-Omega点云缺块 + VGGT手部云团 根因分析
@@ -223,6 +190,9 @@ Stage5 (run_post_pipeline.py) 从GLB加载3D资产时存在两个严重bug:
   - §13.3 VGGT手部云团: 160帧×手部像素面积=大量散乱3D点, PointHead对动态物体也输出高置信度
   - §13.4 改进方案: 降低阈值/过滤深度异常值/使用VGGT4D
   - §13.5 三模型点云质量对比表
+
+### ⚠️ Docs to Review
+- 无需同步的.md文件
 
 ---
 
@@ -244,6 +214,9 @@ Stage5 (run_post_pipeline.py) 从GLB加载3D资产时存在两个严重bug:
 
 - **docs/VGGT_Models_Comparison.md**:
   - §15.7 方案1标记为已实现, 更新代码示例和效果说明
+
+### ⚠️ Docs to Review
+- 无需同步的.md文件
 
 ---
 
@@ -270,162 +243,179 @@ Stage5 (run_post_pipeline.py) 从GLB加载3D资产时存在两个严重bug:
     - 改进方案: 时间持续性过滤/缩小膨胀/调整阈值/时间一致性后处理
   - §13.5 VGGT4D整体可用性从★★★★★降为★★★★☆(过度标记)
 
+### ⚠️ Docs to Review
+- 无需同步的.md文件
+
 ---
 
-## [2026-06-03] - 3D物体摆放技术文档更新 + 手部遮挡深度分析
+## [2026-06-23 16:30] - Stage2 四阶段Z轴对齐 + GLB 5个逻辑 + z_axis_alignment.json 记录
 
-### 核心内容
-1. 在 mainv2_technical_doc.md 中新增 Stage 3 完整流程与实际代码
-2. 新增手部遮挡问题的深度分析与5种改进方案
-3. 新增3D物体摆放位置影响因素总结
+### 任务
+1. 确认 SAM3 是否支持点提示 → 不支持，用 VLM+box prompt 近似
+2. `--enable_stage4 --enable_stage5` 同时启用时生成 5 个 GLB
+3. `pose_changes.json` 接入 Stage4 记录，不启用时无 bug
+4. 分析 068/121 日志 Z 轴对齐效果
+5. 添加 Z 轴对齐结果记录
 
 ### Changed
 
-- **docs/mainv2_technical_doc.md**: 新增第六~八节
-  - §6 Stage 3 完整流程与实际代码:
-    - 6.1 run_stage3() 入口代码
-    - 6.2 get_optimal_view_frame_id() 实际代码（含动静态判断参数表）
-    - 6.3 generate_3d_asset_in_subprocess() 实际代码
-    - 6.4 generate_3d_asset() T矩阵计算实际代码（含数值示例）
-    - 6.5 compute_surface_area_from_pointmap() 实际代码
-    - 6.6 Stage 3 数据流图
-  - §7 手部遮挡问题的深度分析与改进建议:
-    - 7.1 问题描述（连锁问题图）
-    - 7.2 长时间遮挡的特殊问题
-    - 7.3 五种改进方案（手部感知帧选择/mask后处理/mesh连通分量清理/2D时序连续性去重/多帧融合）
-    - 7.4 方案优先级与实施建议
-  - §8 3D物体摆放位置的影响因素总结:
-    - 8.1 位置精度的影响链
-    - 8.2 各因素对位置的影响程度
-    - 8.3 main.py vs mainv2.py 在3D摆放上的关键差异
+- **mainv2.py**:
+  - 新增 import: `align_via_objects`, `align_via_vlm_floor_points`, `align_via_large_plane`, `align_via_geocalib`, `segment_large_flat_surfaces`
+  - 新增 `_load_vlm_model()` 辅助函数 (Stage2.5 VLM 加载)
+  - 新增 `_is_identity_alignment()` 判断对齐是否失败 (返回单位阵)
+  - `run_stage2()` 新增 `vlm_checkpoint` 参数，实现四阶段 Z 轴对齐 fallback 链:
+    - 阶段1: `align_to_room_coordinate_system` (SAM3 floor+wall 文本提示)
+    - 阶段2: `align_via_objects` (放宽阈值 + floor/PCA)
+    - 阶段2.5: `align_via_vlm_floor_points` (VLM 地面参考点 + SAM3 box prompt)
+    - 阶段3: `align_via_large_plane` (SAM3 大平面 mask)
+    - 阶段4: `align_via_geocalib` (GeoCalib 重力估计)
+  - 新增 `z_axis_alignment.json` 保存: 记录 align_method, R_matrix, t_vector, is_identity, align_info, n_wall_masks, n_floor_masks
+  - `main()` 中 `run_stage2()` 调用传入 `vlm_checkpoint`
+  - Stage4 后记录 `pose_history` (仅 `args.enable_stage4` 时)
+  - Stage5 最终 GLB 命名: 有 stage4 → `final_scene_stage4_5.glb`，无 stage4 → `final_scene_stage5.glb`
 
-- **CHANGE_LOG.md**: 合并原 CHANGES.md 内容，统一变更记录文件
+- **src/geometry_utils.py**:
+  - 新增 `align_via_objects()` — 阶段2: 放宽阈值 + 只用 floor (+ wall 或 PCA)
+  - 新增 `align_via_vlm_floor_points()` — 阶段2.5: VLM + SAM3 box prompt
+  - 新增 `align_via_large_plane()` — 阶段3: SAM3 大平面 mask
+  - 新增 `align_via_geocalib()` — 阶段4: GeoCalib 重力估计
+  - 新增 `_orient_floor_normal()` — 确保 floor_normal 朝上
+  - 新增 `_build_R_t_from_floor()` — 从 floor 平面构造 R, t
 
----
+- **src/object_segmentation.py**:
+  - 新增 `detect_floor_reference_points_with_vlm()` — VLM 识别地面参考点
+  - 新增 `segment_floor_with_box_prompts()` — SAM3 box prompt 分割 floor
+  - 新增 `segment_large_flat_surfaces()` — 阶段3 大平面分割
 
-## [2026-06-03] - 修复Stage5 scene_graph逻辑 + Stage1帧数对齐
+- **tools/refine_inter_object_placement.py**:
+  - `refine_inter_object_relations()` 新增 `final_glb_name` 参数
+  - 最终 GLB 保存路径使用 `final_glb_name` (支持 `final_scene_stage4_5.glb`)
 
-### Changed
-- tools/infer_relations_scene_graph.py:
-  - convert_scene_graph_to_relations() 核心规则修复:
-    1. 只修改 "supported by other objects" 的物体关系
-    2. 已确定的关系 (floor/wall/embedded/attached) 不改变
-    3. VLM判断不出具体关系时保持原样 "supported by other objects"
-- tools/generate_scene_json_stage1.py:
-  - 新增 --vggt_max_frames 参数 (默认160), 控制VGGT 3D重建帧数
-  - VGGT帧数不再硬编码160, 改为从参数读取
-- mainv2.py:
-  - run_stage1() 新增 vggt_max_frames 参数, 传递 --max_frames (Stage2的VGGT帧数) 到 Stage1
-  - Stage1 和 Stage2 的 VGGT 帧数现在保持一致
-- docs/mainv2_technical_doc.md:
-  - 9.3 scene_graph方式新增"核心规则"说明, 强调只修改 "other objects" 关系
+- **docs/mainv2_technical_doc.md**:
+  - 新增 "Stage 2 四阶段 Z 轴对齐" 章节 (含优先级表、代码示例、SAM3 点提示说明)
+  - 更新 GLB 文件体系: 按启用阶段列出 GLB 数量 (2/3/4/5)
+  - 新增 "位姿变化记录 pose_changes.json" 章节
+  - 更新 Q1: GLB 文件数量说明
+  - 修正 Stage5 逻辑描述
 
----
-
-## [2026-06-03] - mainv2 完整调整模式改进
+- **docs/questions.md**:
+  - 新增 Q61-Q64: SAM3 点提示、GLB 数量、pose_changes.json Stage4 记录、068/121 日志分析
 
 ### Added
-- tools/infer_relations_scene_graph.py: SimRecon风格的场景图关系推断工具
-  - create_id_labeled_image(): 在帧图像上为每个可见实例绘制ID标注(绿色边框+红色编号)
-  - select_best_frame_for_labeling(): 选择显示最多物体的帧
-  - infer_relations_from_scene_graph(): 使用SimRecon风格VLM prompt推断关系
-  - parse_scene_graph_output(): 解析VLM输出为场景图JSON
-  - post_process_scene_graph(): 物理常识后处理(柜子不应挂在墙等)
-  - convert_scene_graph_to_relations(): 将场景图转换为ReplicateAnyScene格式
-  - infer_relations_scene_graph(): 完整推断流程(创建标注图→VLM推断→格式转换)
 
-### Changed
-- mainv2.py:
-  - GLB命名规则改为按Stage命名: final_scene.glb(基础) / final_scene_stage4.glb / final_scene_stage5.glb / final_scene_stage4_5.glb
-  - Stage4后保存 all_instances_stage4.pkl 和 final_scene_stage4.glb
-  - run_stage5()新增参数: deduplicated_all_masks, stage5_method
-  - Stage5.1关系推断新增scene_graph方式(SimRecon风格,默认), 保留per_object旧方式
-  - 新增 --stage5_method 命令行参数 (scene_graph|per_object)
-  - main()中Stage5逻辑改为调用run_stage5()函数
-  - 文件头注释更新: GLB命名说明、参数总览、使用方式示例
-- tools/run_post_pipeline.py:
-  - run_refine_relations()新增参数: stage5_method, categories_and_relations
-  - 支持scene_graph方式的关系推断
-  - 新增 --stage5_method 命令行参数
-  - 文件头注释更新: Stage5.1两种方式说明
-- docs/mainv2_technical_doc.md:
-  - 新增第九章"mainv2完整调整模式", 包含:
-    - 9.1 流水线总览(完整流程图)
-    - 9.2 最优视角帧选取:动静态策略(判断信号/动态策略/静态策略)
-    - 9.3 Stage5关系推断:两种方式(scene_graph vs per_object对比)
-    - 9.4 Stage5.2几何精修(sp_refinement.py方式)
-    - 9.5 GLB命名规则(按Stage命名+数据流图)
-    - 9.6 后处理管线(run_post_pipeline.py使用方式)
-    - 9.7 完整命令行参数
-  - 8.3对比表新增GLB命名和关系推断两行
+- **test_glb_alignment_logic.py**: 测试 GLB 命名逻辑 (6 种组合)、z_axis_alignment.json 格式、_is_identity_alignment 判断、068 日志分析
+
+### 测试结果
+
+```
+GLB 命名逻辑: 6/6 通过
+  stage4=OFF, stage5=ON, inter_obj=True → 4 个 GLB (068 现状)
+  stage4=ON, stage5=ON, inter_obj=True → 5 个 GLB (新逻辑)
+z_axis_alignment.json 格式: 通过
+_is_identity_alignment: 通过
+068 日志分析: 旧代码无 Z 轴对齐输出, theta_gravity 最大 167° (严重倾斜)
+```
+
+### 068/121 日志分析结论
+
+- 两个日志均为**旧代码**运行，Stage2 无四阶段对齐输出
+- 068: theta_gravity 135°-167° (严重倾斜，接近倒立)
+- 121: cabinet_0 theta_gravity=171.9° (几乎倒立)
+- pose_changes.json 只有 initial/basic_refinement/stage5，无 stage4
+- 需用新代码重跑才能验证四阶段对齐效果
 
 ### ⚠️ Docs to Review
-- 无需额外同步, mainv2_technical_doc.md 已完整更新
+- 无需额外同步
 
 ---
 
-## [2026-06-03] - object_tracking 管线清理与修复
+## [2026-06-23 18:00] - 添加 --cleanup 参数 + GLB 流程图 + 修复文档
+
+### 任务
+1. 添加 `--cleanup` 参数，运行结束后自动清理中间文件
+2. 梳理 GLB 传递流程，在技术文档中给出流程图
+3. 验证 mainv2.py 当前能正常运行
 
 ### Changed
 
-- **object_tracking/run_pipeline.py**: 修复 import 错误（旧代码使用 `from point_tracker import ...` 但文件已改名为 `02_point_tracker.py`），改用 `importlib.util.spec_from_file_location` 加载数字开头文件；新增 Step 0 GLB-视频对齐自动执行；步骤编号修正为 Step 0~4
-- **object_tracking/01_glb_video_align.py**: 删除死代码 `extract_extrinsics_from_hawor()` 和 `--hawor_npz` 参数（该分支只打印警告就 return）；修复帧计数 bug（`frame_indices.index(i)` → `enumerate`）；简化 `main()` 只保留 `--extrinsics_dir` 路径
-- **object_tracking/02_point_tracker.py**: 删除 `sample_query_points_from_sam3_mask()` 函数（SAM3 不是本管线的一部分）；简化 `run_point_tracking()` 签名，移除 `object_masks` 参数
-- **object_tracking/__init__.py**: 新增 `load_extrinsics_from_dir` 和 `load_intrinsic` 导出
-- **object_tracking/simulation/run_simulation.py**: 修正 docstring 中对已删除 `action_semantics` 的引用，改为 `grasp_controller`
-- **object_tracking/USAGE.md**: 重写为完整管线文档，步骤编号统一为 Step 0~4，新增管线输出目录结构说明
+- **mainv2.py**:
+  - 新增 `--cleanup` 参数 (L1366-1367): 运行结束后删除 `all_instances*.pkl`, `color/`, `depth/`, `extrinsics/`, `keyframes/`, `optimal_frames/`
+  - 新增清理逻辑 (L1328-1356): 统计释放空间并打印
 
-### Removed
+- **docs/mainv2_technical_doc.md**:
+  - 重写 §4 GLB文件体系: 新增完整流程图 (Stage1→Stage2→Stage3→基础精修→Stage4→Stage5)
+  - 新增 "GLB 传递关系" 图: 明确每个 GLB 的数据来源是 `all_instances` 快照
+  - 新增 "各 GLB 详细说明" 表: 含保存位置(行号)、保存时机、数据来源
+  - 新增 "--cleanup 参数" 说明表
+  - 修正 `run_post_pipeline.py` 数据流: `all_instances.pkl` → Stage4/5 (不再用 `final_scene_base.glb`)
+  - 修正 pipeline 概览: `--enable_stage4 --enable_stage5` 最终输出 `final_scene_stage4_5.glb`
 
-- `CHANGES.md`: 内容已合并到 CHANGE_LOG.md
+### 验证
+
+```
+python3 -m py_compile mainv2.py → OK
+GLB 流程逻辑: 5 个 GLB (stage4+stage5+inter_obj) → 验证通过
+```
 
 ### ⚠️ Docs to Review
-
-- `docs/MERGE_ARCHITECTURE.md`: 管线步骤编号从 Step 0~5 改为 Step 0~4，需同步更新
-
----
-
-## [2026-06-03 18:40] - 将 ReplicateAnyScene 作为 submodule 上传到 Ego-Video-to-SIM
-
-### Changed
-
-- **.gitignore**: 扩展排除规则，新增排除大文件类型（*.pt, *.ckpt, *.safetensors, *.pth, *.bin, *.onnx, *.h5, *.ply, *.glb, *.gltf, *.obj, *.stl, *.fbx）和大目录（output_v2/, models/, assets/, hand_removal/, stage4/），以及 object_tracking/test_output/
-
-### Added
-
-- 将 ReplicateAnyScene 全部代码文件（62个文件，约296KB）推送到独立仓库 `git@github.com:ananansmall/Ego-centric-Video-to-Simulation.git`
-- 在 `Ego-Video-to-SIM` 仓库中添加 ReplicateAnyScene 为 git submodule（路径: `ReplicateAnyScene/`，指向 `Ego-centric-Video-to-Simulation` 仓库）
-
-### 排除的大文件/目录
-
-| 目录/文件类型 | 大小 | 排除原因 |
-|---|---|---|
-| models/ | 16G | 模型权重文件 |
-| output_v2/ | 2.3G | 输出数据（图片、深度图、点云、3D场景） |
-| assets/ | 3.3G | 资源文件 |
-| outputs/ | 2.9G | 输出数据 |
-| sam3/ | 76M | 子模块 |
-| vggt/ | 64M | 子模块 |
-| sam-3d-objects/ | 225M | 子模块 |
+- 无需额外同步
 
 ---
 
-## [2026-06-03 22:00] - 添加 HaWoR 为 submodule + 更新 ReplicateAnyScene + 生成使用指南
+## [2026-06-23 22:30] - 修复 SP精修 on_top 阈值 + 大物体穿模分离 + 重建工具
 
-### Added
+### 任务
+1. 修复 Stage5 SP精修: on_top 策略 0.3m 阈值导致物体卡在桌子内部
+2. 修复 resolve_penetrations: 大物体穿模分离距离不足
+3. 确认 GLB 传递链正确性
+4. 创建 tools/rebuild_glbs_from_json.py
 
-- 在 `Ego-Video-to-SIM` 仓库中添加 HaWoR 为 git submodule（路径: `HaWoR/`，指向上游 `ThunderVVV/HaWoR` 仓库）
-- 在 `Ego-Video-to-SIM` 仓库中添加 `SUBMODULE_GUIDE.md`，包含完整的 submodule 使用指南：
-  - 克隆仓库（含子模块）
-  - 子模块的日常操作（拉取更新、修改代码、推送）
-  - 完整工作流示例（修改代码、部署、添加/删除子模块）
-  - 常见问题排查
-  - 大文件处理说明
-  - 调用关系图
+### 根因分析
+
+**121 日志关键发现**:
+```
+[on_top] z_offset=+0.5421m 超出阈值 (|z_offset|>0.3m), 保留原位
+```
+- 15 个物体中 14 个被拒绝移动 (z_offset > 0.3m)
+- VLM 正确判定 on_top, 但 SP精修拒绝执行贴合
+- 穿模修复只做 0.01m 分离, 对大物体无效
 
 ### Changed
 
-- **ReplicateAnyScene**: 推送最新代码到远程仓库（13个文件更新，包括 mainv2.py、object_tracking/、tools/、docs/ 等）
-- **Ego-Video-to-SIM**: 更新 ReplicateAnyScene 子模块引用到最新 commit (b888cc4)
+- **tools/refine_inter_object_placement.py**:
+  - `sp_refine_on_top()`: 移除 0.3m 阈值, VLM 判定 on_top 后始终执行 z 轴贴合
+  - `resolve_penetrations()`: 大物体分离距离从 `pen_depth*1.5+0.01` 改为分级:
+    - 超大物体 (>0.5m): `pen_depth + 0.10m`
+    - 大物体 (>0.3m): `pen_depth + 0.05m`
+    - 小物体: `pen_depth + 0.01m`
+
+### Added
+
+- **tools/rebuild_glbs_from_json.py**: 从 pose_changes.json 重建各阶段 GLB
+  - 用法: `python tools/rebuild_glbs_from_json.py --scene_dir output_v2/xxx`
+  - 输出: `rebuild_initial.glb`, `rebuild_basic_refinement.glb`, `rebuild_stage5.glb`
+
+### GLB 传递链确认
+
+```
+all_instances (内存中就地修改)
+  Stage3完成 → final_scene_initial.glb     (快照#1)
+  基础精修   → final_scene.glb             (快照#2)
+  Stage4    → final_scene_stage4.glb       (快照#3)
+  Stage5 SP → final_scene_stage5_sp.glb    (快照#4)
+  Stage5最终 → final_scene_stage4_5.glb     (快照#5)
+```
+每个 GLB 都是 all_instances 在该时间点的快照, 正确继承前一阶段结果。
+
+### 验证
+```
+python3 -m py_compile mainv2.py → OK
+python3 -m py_compile tools/refine_inter_object_placement.py → OK
+python3 -m py_compile tools/rebuild_glbs_from_json.py → OK
+pose_changes.json 结构验证: 15个物体, 3阶段(initial/basic_refinement/stage5), 4x4 T_matrix
+```
+
+### ⚠️ Docs to Review
+- docs/mainv2_technical_doc.md: SP精修策略变更 (0.3m阈值移除)
 
 ---
