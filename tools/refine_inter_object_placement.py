@@ -218,7 +218,7 @@ def _load_vlm_model(checkpoint):
     return model, processor
 
 
-def _vlm_inference(image, model, processor, prompt, max_new_tokens=512):
+def _vlm_inference(image, model, processor, prompt, max_new_tokens=256):
     """调用VLM进行单次推理"""
     import torch
     messages = [
@@ -468,16 +468,30 @@ def _build_instance_frame_map(optimal_instance_frames, instance_count,
         instance_count: {category: int}
         keyframe_images: {vid_idx: (PIL.Image, src)}
         keyframe_visibility: {vid_idx: [name, ...]}
-        target_categories: 目标类别列表
+        target_categories: 目标类别列表 (可包含 "bottle" 或 "bottle_0" 格式)
     返回:
         instance_to_frames: {inst_key: [(PIL.Image, src), ...]}
         instance_to_category: {inst_key: category}
     """
+    import re as _re
     instance_to_frames = defaultdict(list)
     instance_to_category = {}
     seen_sources = defaultdict(set)
 
+    # 过滤 target_categories: 去掉实例级 key (如 "bottle_0"),
+    # 只保留类别级 key (如 "bottle"), 避免生成 "bottle_0_0" 这种 ghost key
+    base_categories = []
     for cat in target_categories:
+        if _re.match(r'^[a-zA-Z_]+_\d+$', cat):
+            # "bottle_0" -> "bottle"
+            base = _re.sub(r'_\d+$', '', cat)
+            if base not in base_categories:
+                base_categories.append(base)
+        else:
+            if cat not in base_categories:
+                base_categories.append(cat)
+
+    for cat in base_categories:
         n_inst = instance_count.get(cat, 1)
         if n_inst == 0:
             n_inst = 1
@@ -496,7 +510,7 @@ def _build_instance_frame_map(optimal_instance_frames, instance_count,
         if vid_idx not in keyframe_images:
             continue
         img, src = keyframe_images[vid_idx]
-        for cat in target_categories:
+        for cat in base_categories:
             if cat in visible_names:
                 n_inst = instance_count.get(cat, 1)
                 if n_inst == 0:
@@ -574,55 +588,86 @@ def _get_transformed_center(instance_info, transform_matrix=None):
 
 
 def _align_upright(info):
-    """旋转对齐: 让物体上方向对齐z轴 (与 refine_supported_by_floor_object 的旋转逻辑一致)"""
-    transform_matrix = info["T"].copy()
-    upper_real_vector = np.array([0, 0, 1])
-    upper_transformed_vector = transform_matrix[:3, 1]
-    upper_norm = np.linalg.norm(upper_transformed_vector)
-    if upper_norm > 1e-8:
-        upper_transformed_vector = upper_transformed_vector / upper_norm
-        theta_gravity = np.arccos(np.clip(np.dot(upper_real_vector, upper_transformed_vector), -1.0, 1.0)) / np.pi * 180
-        if theta_gravity < 10.0 or theta_gravity > 170.0:
-            if theta_gravity < 90.0:
-                upper_align_matrix = trimesh.geometry.align_vectors(upper_transformed_vector, upper_real_vector)
-            else:
-                upper_align_matrix = trimesh.geometry.align_vectors(upper_transformed_vector, -upper_real_vector)
-            transform_matrix[:3, :3] = upper_align_matrix[:3, :3] @ transform_matrix[:3, :3]
-    info["T"] = transform_matrix
+    """旋转对齐: 让物体上方向对齐z轴
+
+    当前已禁用旋转对齐，只做z轴平移。保留函数接口以便后续启用。
+
+    禁用原因: VGGT重建的物体朝向可能本身就不准确，强制旋转可能
+    导致更差的结果。当前优先保证z轴位置正确(底面贴支撑面)，
+    旋转对齐待后续验证效果后再启用。
+
+    Args:
+        info: 物体信息字典，含 original_mesh 和 T
+
+    Returns:
+        dict: 不做任何修改，原样返回
+    """
     return info
 
 
-def sp_refine_on_top(supported_info, supporter_info):
-    """supported底面贴supporter顶面 — 等价于"把supporter顶面当作floor做refine_supported_by_floor_object"
+def sp_refine_on_top(supported_info, supporter_info, max_offset=0.3, initial_offset=None):
+    """supported底面贴supporter顶面 (只做z轴对齐)
 
-    核心逻辑 (与 refine_supported_by_floor_object 完全一致，只是z=0换成supporter_top_z):
-      Step 1: 旋转对齐 — 让物体上方向对齐z轴 (竖直)
-      Step 2: z轴平移 — supported底面对齐到supporter顶面 (等同于floor的z=0对齐)
+    只做z轴平移，不做旋转对齐，不做xy约束。
 
-    物理约束:
-      supported.bottom_z = supporter.top_z (底面贴顶面, 不穿模不悬空)
+    设计哲学:
+      - VLM 已经判定物体在支撑物上方 (on_top), 所以始终执行 z 轴贴合
+      - 不再有 0.3m 阈值限制 — 旧版阈值导致物体卡在桌子内部无法移出
+      - z_offset = supporter_top_z - supported_bottom_z
+        正值: 物体在支撑物下方或穿入，向上推
+        负值: 物体悬空在支撑物上方，向下落
+        接近0: 已接触，无需调整
+
+    Args:
+        supported_info: 被支撑物体的信息字典，含 original_mesh 和 T
+        supporter_info: 支撑物体的信息字典，含 original_mesh 和 T
+        max_offset: (已废弃, 保留参数兼容) 不再限制偏移量
+        initial_offset: (已废弃, 保留参数兼容)
+
+    Returns:
+        dict: T矩阵已更新的 supported_info
     """
+    old_pos = supported_info["T"][:3, 3].copy()
+
     supported_info = _align_upright(supported_info)
 
-    supporter_bounds = _get_transformed_bounds(supporter_info)
-    supported_bounds = _get_transformed_bounds(supported_info)
+    transform_matrix = supported_info["T"].copy()
 
-    supporter_top_z = supporter_bounds[1, 2]
-    supported_bottom_z = supported_bounds[0, 2]
+    transformed_mesh = supported_info["original_mesh"].copy()
+    transformed_mesh.apply_transform(transform_matrix)
+    supported_bottom_z = transformed_mesh.bounds[0, 2]
+
+    supporter_mesh = _get_transformed_mesh(supporter_info)
+    supporter_top_z = supporter_mesh.bounds[1, 2]
 
     z_offset = supporter_top_z - supported_bottom_z
 
     if abs(z_offset) < 1e-6:
         return supported_info
 
-    if z_offset < -0.5:
-        return supported_info
+    # 始终执行 z 轴贴合 (VLM 已判定 on_top, 无需阈值判断)
+    reason = f"z_offset={z_offset:+.4f}m, 贴合支撑物顶面"
 
-    translation_vec = np.array([0.0, 0.0, z_offset])
-    transform_matrix = supported_info["T"].copy()
-    transform_matrix = trimesh.transformations.translation_matrix(translation_vec) @ transform_matrix
+    # 应用 z 轴平移
+    translation_vector = np.array([0, 0, z_offset])
+    translation_matrix = trimesh.transformations.translation_matrix(translation_vector)
+    transform_matrix = translation_matrix @ transform_matrix
 
     supported_info["T"] = transform_matrix
+
+    # 后检查: 验证贴合是否成功
+    post_mesh = supported_info["original_mesh"].copy()
+    post_mesh.apply_transform(supported_info["T"])
+    post_bottom_z = post_mesh.bounds[0, 2]
+    residual = post_bottom_z - supporter_top_z
+    if abs(residual) > 1e-4:
+        correction = supporter_top_z - post_bottom_z
+        supported_info["T"][2, 3] += correction
+        print(f"      ⚠️ [on_top] 残余间隙={residual:.4f}m, 修正{correction:+.4f}m", flush=True)
+
+    new_pos = supported_info["T"][:3, 3].copy()
+    print(f"      [on_top] {reason}, supporter_top={supporter_top_z:.4f}m, "
+          f"pos: ({old_pos[0]:.3f},{old_pos[1]:.3f},{old_pos[2]:.3f}) → ({new_pos[0]:.3f},{new_pos[1]:.3f},{new_pos[2]:.3f})", flush=True)
     return supported_info
 
 
@@ -639,6 +684,7 @@ def sp_refine_inside(supported_info, supporter_info):
       Step 2: z轴平移 — supported底面对齐到supporter内部30%高度
       Step 3: 穿模检查 — 穿出顶部/底部则修正
     """
+    old_pos = supported_info["T"][:3, 3].copy()
     supported_info = _align_upright(supported_info)
 
     transform_matrix = supported_info["T"].copy()
@@ -672,6 +718,8 @@ def sp_refine_inside(supported_info, supporter_info):
         ) @ transform_matrix
 
     supported_info["T"] = transform_matrix
+    new_pos = supported_info["T"][:3, 3].copy()
+    print(f"      [inside] pos: ({old_pos[0]:.3f},{old_pos[1]:.3f},{old_pos[2]:.3f}) → ({new_pos[0]:.3f},{new_pos[1]:.3f},{new_pos[2]:.3f})", flush=True)
     return supported_info
 
 
@@ -689,6 +737,7 @@ def sp_refine_against_side(supported_info, supporter_info, walls_info=None):
       Step 3: x/y轴: 找最近侧面方向，移动到刚好接触
       Step 4: 穿模检查
     """
+    old_pos = supported_info["T"][:3, 3].copy()
     supported_info = _align_upright(supported_info)
 
     transform_matrix = supported_info["T"].copy()
@@ -748,6 +797,8 @@ def sp_refine_against_side(supported_info, supporter_info, walls_info=None):
             ) @ transform_matrix
 
     supported_info["T"] = transform_matrix
+    new_pos = supported_info["T"][:3, 3].copy()
+    print(f"      [against_side] pos: ({old_pos[0]:.3f},{old_pos[1]:.3f},{old_pos[2]:.3f}) → ({new_pos[0]:.3f},{new_pos[1]:.3f},{new_pos[2]:.3f})", flush=True)
     return supported_info
 
 
@@ -762,6 +813,7 @@ def sp_refine_hanging_below(supported_info, supporter_info):
       Step 1: 旋转对齐 — 让物体竖直
       Step 2: z轴平移 — supported顶面对齐到supporter底面
     """
+    old_pos = supported_info["T"][:3, 3].copy()
     supported_info = _align_upright(supported_info)
 
     transform_matrix = supported_info["T"].copy()
@@ -781,6 +833,8 @@ def sp_refine_hanging_below(supported_info, supporter_info):
     transform_matrix = trimesh.transformations.translation_matrix(translation_vec) @ transform_matrix
 
     supported_info["T"] = transform_matrix
+    new_pos = supported_info["T"][:3, 3].copy()
+    print(f"      [hanging_below] z_offset={z_offset:.4f}m, pos: ({old_pos[0]:.3f},{old_pos[1]:.3f},{old_pos[2]:.3f}) → ({new_pos[0]:.3f},{new_pos[1]:.3f},{new_pos[2]:.3f})", flush=True)
     return supported_info
 
 
@@ -924,8 +978,47 @@ def _get_aabb_overlap(mesh_a, mesh_b):
     return overlaps, overlap_x, overlap_y, overlap_z
 
 
-def _check_mesh_penetration(mesh_a, mesh_b, n_samples=500):
-    """Check if mesh_a penetrates into mesh_b using vertex sampling.
+def _check_mesh_penetration_fcl(mesh_a, mesh_b):
+    """使用FCL精确碰撞检测判断mesh_a是否穿入mesh_b
+
+    相比旧版AABB+顶点采样方法，FCL提供:
+      - 精确的mesh-mesh碰撞检测 (非AABB近似)
+      - 精确的穿透深度和分离方向
+      - 不受顶点密度影响
+
+    Returns:
+        (penetrates, penetration_depth, sep_axis):
+            penetrates: bool, whether penetration exists
+            penetration_depth: float, estimated penetration depth
+            sep_axis: int (0=x, 1=y, 2=z), best separation axis
+    """
+    try:
+        from trimesh.collision import CollisionManager
+        manager = CollisionManager()
+        manager.add_object("b", mesh_b)
+        collides, contacts = manager.in_collision_single(mesh_a, return_data=True)
+        if not collides or not contacts:
+            return False, 0.0, 2
+
+        max_depth = 0.0
+        avg_normal = np.zeros(3)
+        for c in contacts:
+            if c.depth > max_depth:
+                max_depth = c.depth
+            avg_normal += np.array(c.normal)
+        avg_normal /= len(contacts)
+        norm = np.linalg.norm(avg_normal)
+        if norm > 1e-8:
+            avg_normal /= norm
+
+        sep_axis = int(np.argmax(np.abs(avg_normal)))
+        return True, float(max_depth), sep_axis
+    except (ImportError, ValueError):
+        return _check_mesh_penetration_legacy(mesh_a, mesh_b)
+
+
+def _check_mesh_penetration_legacy(mesh_a, mesh_b, n_samples=500):
+    """旧版AABB+顶点采样碰撞检测 (FCL不可用时的回退方案)
 
     Returns:
         (penetrates, penetration_depth, sep_axis):
@@ -989,20 +1082,23 @@ def _check_mesh_penetration(mesh_a, mesh_b, n_samples=500):
 
 
 def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
-                         categories_and_relations=None, dry_run=False):
+                         categories_and_relations=None, dry_run=False,
+                         max_iterations=8):
     """全局穿模检测与解决
 
     策略:
-      1. 对每对物体先用AABB快速排除，再用顶点采样精确检测穿模
-      2. 如果穿模，沿分离轴推开（优先推被支撑物，保留支撑物不动）
+      1. 对每对物体用FCL精确碰撞检测 (回退到AABB+顶点采样)
+      2. 如果穿模，沿FCL返回的分离方向推开（优先推被支撑物，保留支撑物不动）
       3. 推开后确保不穿出地面(z=0)
       4. 迭代直到无穿模或达到最大迭代次数
+      5. 大物体穿模: 增加分离余量 (按穿模深度比例增加)
 
     参数:
         all_instances: {category: [instance_info, ...]}
         refined_relations: 关系字典，用于判断谁是被支撑物（优先移动）
         verbose: 是否打印详细信息
         dry_run: 如果为True, 只检测和警告, 不实际修改T矩阵
+        max_iterations: 最大迭代次数 (默认8, 比旧版5更多)
     返回:
         更新后的 all_instances
     """
@@ -1040,8 +1136,8 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
             all_meshes.append((category, idx, mesh, info))
 
     penetration_warnings = []
-    max_iterations = 0 if dry_run else 1
-    for iteration in range(max(1, max_iterations)):
+    effective_max_iter = 1 if dry_run else max_iterations
+    for iteration in range(effective_max_iter):
         any_resolved = False
 
         for i in range(len(all_meshes)):
@@ -1053,7 +1149,7 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
                 if not overlaps:
                     continue
 
-                penetrates, pen_depth, sep_axis = _check_mesh_penetration(mesh_i, mesh_j)
+                penetrates, pen_depth, sep_axis = _check_mesh_penetration_fcl(mesh_i, mesh_j)
                 if not penetrates:
                     continue
 
@@ -1098,7 +1194,6 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
 
                 move_cat, move_idx_orig, move_mesh, move_info = all_meshes[move_idx]
                 other_mesh = mesh_j if move_idx == i else mesh_i
-                move_is_fixed = move_cat.lower().strip() in floor_names or move_cat.lower().strip() in wall_names
 
                 move_center = move_mesh.bounds.mean(axis=0)[sep_axis]
                 other_center = other_mesh.bounds.mean(axis=0)[sep_axis]
@@ -1108,10 +1203,21 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
                 else:
                     direction = -1.0
 
-                if move_is_fixed and sep_axis == 2:
-                    continue
-
-                sep_dist = pen_depth + 0.0005
+                # 大物体穿模: 增加分离余量
+                # 基础: pen_depth + 0.01m
+                # 大物体 (最大维度 > 0.3m): 增加余量到 pen_depth + 0.05m
+                # 超大物体 (最大维度 > 0.5m): 增加余量到 pen_depth + 0.10m
+                move_size = np.max(move_mesh.bounds[1] - move_mesh.bounds[0])
+                other_size = np.max(other_mesh.bounds[1] - other_mesh.bounds[0])
+                max_size = max(move_size, other_size)
+                if max_size > 0.5:
+                    # 超大物体 (柜子/桌子等): 大幅分离
+                    sep_dist = pen_depth + 0.10
+                elif max_size > 0.3:
+                    # 大物体: 中等分离
+                    sep_dist = pen_depth + 0.05
+                else:
+                    sep_dist = pen_depth + 0.01
                 translation_vec = np.array([0.0, 0.0, 0.0])
                 translation_vec[sep_axis] = direction * sep_dist
 
@@ -1150,11 +1256,264 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
     return all_instances
 
 
+def check_stability(all_instances, refined_relations=None, categories_and_relations=None,
+                    contact_threshold=0.2, gap_threshold=0.05, verbose=True):
+    """检查物体稳定性: 接触面积是否足够、是否悬空
+
+    对每个 "supported by {name}" 的物体:
+      1. 检查是否与支撑物有接触 (非悬空)
+      2. 检查接触面积占比是否足够 (非边缘放置)
+
+    对每个 "supported by floor" 的物体:
+      1. 检查是否接触地面 (bottom_z ≈ 0)
+
+    参数:
+        all_instances: {category: [instance_info, ...]}
+        refined_relations: 关系字典
+        categories_and_relations: 原始关系字典
+        contact_threshold: 接触面积占比阈值 (默认0.2, 即底面20%需有接触)
+        gap_threshold: 悬空判定阈值 (默认0.05m, 即5cm间隙视为悬空)
+        verbose: 是否打印详细信息
+    返回:
+        (all_instances, unstable_list): 更新后的实例 + 不稳定物体列表
+    """
+    _all_rels = {}
+    if categories_and_relations:
+        _all_rels.update(categories_and_relations)
+    if refined_relations:
+        _all_rels.update(refined_relations)
+
+    unstable_list = []
+    fixed_count = 0
+
+    floor_items = []
+    supported_items = []
+    for category, instances in all_instances.items():
+        for idx, info in enumerate(instances):
+            inst_key = f"{category}_{idx}"
+            rel = _all_rels.get(inst_key, _all_rels.get(category, ""))
+            rel_lower = rel.lower()
+            if "floor" in rel_lower:
+                floor_items.append((category, idx, info, rel, rel_lower))
+            elif rel.startswith("supported by ") and "other objects" not in rel_lower and "floor" not in rel_lower:
+                supported_items.append((category, idx, info, rel, rel_lower))
+
+    # ── Phase 1: 地面物体旋转对齐 + z轴贴合 ──
+    # 学习 sp_refinement.py 的 theta_gravity 逻辑，但阈值更宽松
+    # 基础精修只在 theta_gravity < 10° 时对齐旋转，这里放宽到 1°
+    # 记录已稳定的物体, Phase 4 不再重复修复
+    stabilized = set()
+    for category, idx, info, rel, rel_lower in floor_items:
+        T = info["T"]
+        upper_transformed = T[:3, 1] / np.linalg.norm(T[:3, 1])
+        theta_gravity = np.arccos(np.clip(np.dot(np.array([0, 0, 1]), upper_transformed), -1.0, 1.0)) / np.pi * 180
+
+        rotation_fixed = False
+        if theta_gravity > 1.0 and theta_gravity < 179.0:
+            if theta_gravity < 90.0:
+                align_matrix = trimesh.geometry.align_vectors(upper_transformed, np.array([0, 0, 1]))
+            else:
+                align_matrix = trimesh.geometry.align_vectors(upper_transformed, np.array([0, 0, -1]))
+            T[:3, :3] = align_matrix[:3, :3] @ T[:3, :3]
+            rotation_fixed = True
+
+        # z 轴贴合: 确保底面在 z=0
+        mesh = _get_transformed_mesh(info)
+        bottom_z = mesh.bounds[0, 2]
+        z_fixed = False
+        if abs(bottom_z) > 0.001:
+            T[2, 3] -= bottom_z
+            z_fixed = True
+
+        if rotation_fixed or z_fixed:
+            fixed_count += 1
+            if verbose:
+                parts = []
+                if rotation_fixed:
+                    parts.append(f"旋转对齐 (theta={theta_gravity:.1f}°→0°)")
+                if z_fixed:
+                    parts.append(f"z轴贴合 (bottom_z={bottom_z:.4f}m→0)")
+                print(f"      🔧 Phase1 地面对齐: {category}_{idx} {', '.join(parts)}", flush=True)
+
+        # 验证稳定: 底面 z=0 且 theta<10°
+        mesh_after = _get_transformed_mesh(info)
+        if abs(mesh_after.bounds[0, 2]) < 0.001 and theta_gravity < 10:
+            stabilized.add(f"{category}_{idx}")
+
+    # ── Phase 2: 支撑物体旋转对齐 + 间隙检测 + 修复 ──
+    # 学习 sp_refinement.py 的 theta_gravity 逻辑，但调低阈值
+    # 基础精修阈值 10°，这里用 5° 以识别更多需要旋转对齐的物体
+    for category, idx, info, rel, rel_lower in supported_items:
+        T = info["T"]
+        upper_transformed = T[:3, 1] / np.linalg.norm(T[:3, 1])
+        theta_gravity = np.arccos(np.clip(np.dot(np.array([0, 0, 1]), upper_transformed), -1.0, 1.0)) / np.pi * 180
+
+        rotation_fixed = False
+        if theta_gravity > 5.0 and theta_gravity < 175.0:
+            if theta_gravity < 90.0:
+                align_matrix = trimesh.geometry.align_vectors(upper_transformed, np.array([0, 0, 1]))
+            else:
+                align_matrix = trimesh.geometry.align_vectors(upper_transformed, np.array([0, 0, -1]))
+            T[:3, :3] = align_matrix[:3, :3] @ T[:3, :3]
+            rotation_fixed = True
+            if verbose:
+                print(f"      🔧 Phase2 旋转对齐: {category}_{idx} theta={theta_gravity:.1f}°→0°", flush=True)
+
+        mesh = _get_transformed_mesh(info)
+        bottom_z = mesh.bounds[0, 2]
+        supporter_name = rel[len("supported by "):].strip()
+        supporter_cat = supporter_name.rsplit("_", 1)[0] if "_" in supporter_name else supporter_name
+
+        supporter_info = _find_supporter_info(all_instances, supporter_name, supporter_cat)
+        if supporter_info is None:
+            continue
+
+        supporter_mesh = _get_transformed_mesh(supporter_info)
+        supporter_top_z = supporter_mesh.bounds[1, 2]
+
+        gap = bottom_z - supporter_top_z
+        if gap > gap_threshold:
+            unstable_list.append({
+                "name": f"{category}_{idx}",
+                "issue": "悬空",
+                "detail": f"距支撑面 {gap:.3f}m (阈值 {gap_threshold}m)",
+            })
+            z_fix = gap
+            info["T"] = trimesh.transformations.translation_matrix(
+                np.array([0.0, 0.0, -z_fix])
+            ) @ info["T"]
+            fixed_count += 1
+            if verbose:
+                print(f"      🔽 Phase2 悬空修复: {category}_{idx} 悬空 {gap:.3f}m → 落到 {supporter_name} 顶面", flush=True)
+            stabilized.add(f"{category}_{idx}")
+            continue
+
+        # ── Phase 3: 接触不足检测 + z轴修复 ──
+        supported_proj = _project_footprint(mesh)
+        supporter_proj = _project_footprint(supporter_mesh)
+
+        try:
+            overlap = supported_proj.intersection(supporter_proj)
+            overlap_area = overlap.area if overlap is not None and not overlap.is_empty else 0.0
+        except Exception:
+            overlap_area = 0.0
+
+        supported_area = supported_proj.area if supported_proj is not None and not supported_proj.is_empty else 1e-6
+        support_ratio = overlap_area / supported_area if supported_area > 1e-6 else 0.0
+
+        if support_ratio < contact_threshold:
+            # 接触不足: 直接对齐 z 轴
+            supporter_top_z = supporter_mesh.bounds[1, 2]
+            supported_bottom_z = mesh.bounds[0, 2]
+            z_gap = supporter_top_z - supported_bottom_z
+
+            if abs(z_gap) > 0.001:
+                correction = z_gap
+                info["T"][2, 3] += correction
+                fixed_count += 1
+                if verbose:
+                    print(f"      🔧 Phase3 接触不足修复: {category}_{idx} z轴修正{correction:+.4f}m "
+                          f"(接触比 {support_ratio:.1%} < {contact_threshold:.0%})", flush=True)
+                stabilized.add(f"{category}_{idx}")
+            else:
+                unstable_list.append({
+                    "name": f"{category}_{idx}",
+                    "issue": "接触不足",
+                    "detail": f"接触面积比 {support_ratio:.1%} (阈值 {contact_threshold:.0%}), z已对齐但xy偏移",
+                })
+
+    # ── Phase 4: 最终 z 轴强制贴合 (兜底) ──
+    # 仅对 Phase 1-3 未修复的物体进行, 避免重复修复
+    phase4_fixed = 0
+    for category, idx, info, rel, rel_lower in floor_items:
+        inst_key = f"{category}_{idx}"
+        if inst_key in stabilized:
+            continue  # Phase 1 已对齐
+        mesh = _get_transformed_mesh(info)
+        bottom_z = mesh.bounds[0, 2]
+        if abs(bottom_z) > 0.001:
+            info["T"][2, 3] -= bottom_z
+            phase4_fixed += 1
+            if verbose:
+                print(f"      🔧 Phase4 地面贴合: {category}_{idx} bottom_z={bottom_z:.4f}m→0", flush=True)
+
+    for category, idx, info, rel, rel_lower in supported_items:
+        inst_key = f"{category}_{idx}"
+        if inst_key in stabilized:
+            continue  # Phase 2/3 已对齐, 不再重复
+        mesh = _get_transformed_mesh(info)
+        bottom_z = mesh.bounds[0, 2]
+        supporter_name = rel[len("supported by "):].strip()
+        supporter_cat = supporter_name.rsplit("_", 1)[0] if "_" in supporter_name else supporter_name
+
+        supporter_info = _find_supporter_info(all_instances, supporter_name, supporter_cat)
+        if supporter_info is None:
+            continue
+
+        supporter_mesh = _get_transformed_mesh(supporter_info)
+        supporter_top_z = supporter_mesh.bounds[1, 2]
+
+        z_gap = supporter_top_z - bottom_z
+        if abs(z_gap) > 0.001:
+            info["T"][2, 3] += z_gap
+            phase4_fixed += 1
+            if verbose:
+                print(f"      🔧 Phase4 支撑贴合: {category}_{idx} z修正{z_gap:+.4f}m "
+                      f"(bottom_z={bottom_z:.4f} → supporter_top={supporter_top_z:.4f})", flush=True)
+
+    fixed_count += phase4_fixed
+
+    if verbose:
+        if unstable_list:
+            contact_issues = sum(1 for u in unstable_list if u["issue"] == "接触不足")
+            gap_issues = sum(1 for u in unstable_list if u["issue"] == "悬空")
+            msg = f"   ⚠️ 稳定性检查: {len(unstable_list)} 个不稳定"
+            if gap_issues:
+                msg += f" (悬空 {gap_issues} 个, 已修复 {fixed_count} 个)"
+            if contact_issues:
+                msg += f" (接触不足 {contact_issues} 个, 需人工确认)"
+            if phase4_fixed:
+                msg += f" [Phase4额外修复 {phase4_fixed} 个]"
+            print(msg, flush=True)
+        else:
+            extra = f" [Phase4额外修复 {phase4_fixed} 个]" if phase4_fixed else ""
+            print(f"   ✅ 稳定性检查: 所有物体稳定{extra}", flush=True)
+
+    return all_instances, unstable_list
+
+
+def _find_supporter_info(all_instances, supporter_name, supporter_cat):
+    """在all_instances中查找支撑物的instance_info"""
+    if supporter_name in all_instances and all_instances[supporter_name]:
+        return all_instances[supporter_name][0]
+    if supporter_cat in all_instances and all_instances[supporter_cat]:
+        return all_instances[supporter_cat][0]
+    for cat, instances in all_instances.items():
+        cat_base = cat.rsplit("_", 1)[0] if "_" in cat else cat
+        if cat_base.lower() == supporter_cat.lower() or cat.lower() == supporter_name.lower():
+            if instances:
+                return instances[0]
+    return None
+
+
+def _project_footprint(mesh):
+    """将mesh投影到xy平面, 返回shapely Polygon"""
+    try:
+        from shapely.geometry import MultiPoint
+        vertices_xy = mesh.vertices[:, :2]
+        if len(vertices_xy) < 3:
+            return None
+        return MultiPoint(vertices_xy).convex_hull
+    except ImportError:
+        return None
+
 def refine_inter_object_relations(all_instances, refined_relations,
                                   walls_info=None, verbose=True,
                                   vlm_checkpoint=None, scene_dir=None,
                                   categories_and_relations=None,
-                                  only_refine_other_objects=False):
+                                  only_refine_other_objects=False,
+                                  initial_T_snapshot=None,
+                                  final_glb_name="final_scene_stage5.glb"):
     """
     主函数: 精修物体间支撑关系的空间位置
 
@@ -1355,13 +1714,50 @@ def refine_inter_object_relations(all_instances, refined_relations,
             if verbose:
                 print(f"   🔧 {supported_name}[{inst_idx}] → {strategy} → {supporter_name}", flush=True)
 
+            # 计算 initial_offset (基础精修前的 z_offset), 用于 sp_refine_on_top 判断 supporter 是否被抬升
+            initial_offset = None
+            if initial_T_snapshot is not None and strategy == "on_top":
+                try:
+                    _init_supporter = initial_T_snapshot.get(supporter_cat, [])
+                    _init_supported = initial_T_snapshot.get(supported_cat, [])
+                    if _init_supported and _init_supporter:
+                        # 找最接近的 supporter 实例 (用 xy 距离)
+                        _sup_xy = supporter_info['T'][:2, 3]
+                        _sup_idx_init = 0
+                        if len(_init_supporter) > 1:
+                            _best_d = float('inf')
+                            for _k, _init_T in enumerate(_init_supporter):
+                                _init_xy = _init_T[:2, 3]
+                                _d = np.linalg.norm(_init_xy - _sup_xy)
+                                if _d < _best_d:
+                                    _best_d = _d
+                                    _sup_idx_init = _k
+                        # 复算 supported/supporter 的初始 bottom/top (用快照中的 T)
+                        from copy import deepcopy
+                        _init_supported_T = deepcopy(_init_supported[inst_idx]) if inst_idx < len(_init_supported) else deepcopy(supported_info['T'])
+                        _init_supporter_T = deepcopy(_init_supporter[_sup_idx_init])
+                        _init_supported_mesh = supported_info['original_mesh'].copy()
+                        _init_supported_mesh.apply_transform(_init_supported_T)
+                        _init_supported_bottom_z = _init_supported_mesh.bounds[0, 2]
+                        _init_supporter_mesh = supporter_info['original_mesh'].copy()
+                        _init_supporter_mesh.apply_transform(_init_supporter_T)
+                        _init_supporter_top_z = _init_supporter_mesh.bounds[1, 2]
+                        initial_offset = float(_init_supporter_top_z - _init_supported_bottom_z)
+                except Exception as e:
+                    if verbose:
+                        print(f"      ⚠️  initial_offset 计算失败: {e}", flush=True)
+                    initial_offset = None
+
             try:
                 if strategy in ("against_side", "leaning"):
                     supported_instances[inst_idx] = sp_refine_fn(
                         supported_info, supporter_info, walls_info
                     )
                 else:
-                    supported_instances[inst_idx] = sp_refine_fn(supported_info, supporter_info)
+                    # on_top/inside: 用 initial_offset 判断, 只在基本正确时微调
+                    supported_instances[inst_idx] = sp_refine_fn(
+                        supported_info, supporter_info, max_offset=0.3, initial_offset=initial_offset
+                    )
             except Exception as e:
                 if verbose:
                     print(f"      ❌ 精修失败: {e}", flush=True)
@@ -1369,6 +1765,58 @@ def refine_inter_object_relations(all_instances, refined_relations,
     # ── 全局穿模解决 ──
     all_instances = resolve_penetrations(all_instances, refined_relations, verbose=verbose,
                                          categories_and_relations=categories_and_relations)
+
+    # 保存 SP精修+穿模修复后的中间结果 (GLB #3)
+    if scene_dir is not None:
+        _sp_glb = os.path.join(scene_dir, "final_scene_stage5_sp.glb")
+        try:
+            _scene = trimesh.Scene()
+            for _cat, _insts in all_instances.items():
+                for _i, _info in enumerate(_insts):
+                    _m = _info["original_mesh"].copy()
+                    _m.apply_transform(_info["T"])
+                    _scene.add_geometry(_m, node_name=f"{_cat}_{_i}")
+            _scene.apply_transform(np.array([
+                [1, 0, 0, 0],
+                [0, 0, 1, 0],
+                [0, -1, 0, 0],
+                [0, 0, 0, 1],
+            ]))
+            _scene.export(_sp_glb)
+            if verbose:
+                print(f"   💾 SP精修中间结果已保存: {_sp_glb}", flush=True)
+        except Exception as e:
+            if verbose:
+                print(f"   ⚠️ SP精修中间结果保存失败: {e}", flush=True)
+
+    # ── 稳定性检查 ──
+    all_instances, unstable_list = check_stability(
+        all_instances, refined_relations=refined_relations,
+        categories_and_relations=categories_and_relations, verbose=verbose
+    )
+
+    # 保存 check_stability 后的最终结果 (GLB #4 / GLB #5)
+    if scene_dir is not None:
+        _final_glb = os.path.join(scene_dir, final_glb_name)
+        try:
+            _scene = trimesh.Scene()
+            for _cat, _insts in all_instances.items():
+                for _i, _info in enumerate(_insts):
+                    _m = _info["original_mesh"].copy()
+                    _m.apply_transform(_info["T"])
+                    _scene.add_geometry(_m, node_name=f"{_cat}_{_i}")
+            _scene.apply_transform(np.array([
+                [1, 0, 0, 0],
+                [0, 0, 1, 0],
+                [0, -1, 0, 0],
+                [0, 0, 0, 1],
+            ]))
+            _scene.export(_final_glb)
+            if verbose:
+                print(f"   💾 Stage5最终结果已保存: {_final_glb}", flush=True)
+        except Exception as e:
+            if verbose:
+                print(f"   ⚠️ Stage5最终结果保存失败: {e}", flush=True)
 
     if verbose:
         print(f"\n✅ 物体间关系精修完成!", flush=True)

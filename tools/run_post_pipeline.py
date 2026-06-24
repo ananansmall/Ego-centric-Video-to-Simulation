@@ -454,9 +454,11 @@ def run_stage4(scene_dir, vggt_data, all_instances, args):
             current_instance += 1
 
     # Stage 4 后穿模修复
-    from tools.refine_inter_object_placement import resolve_penetrations
+    from tools.refine_inter_object_placement import resolve_penetrations, check_stability
     all_instances = resolve_penetrations(all_instances, verbose=True,
                                          categories_and_relations=categories_and_relations)
+    all_instances, _ = check_stability(all_instances, verbose=True,
+                                       categories_and_relations=categories_and_relations)
 
     print(f"✅ Stage 4 完成", flush=True)
     return all_instances

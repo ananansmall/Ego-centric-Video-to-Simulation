@@ -686,6 +686,68 @@ def merge_synonyms(category_name):
     return normalize_category_name(name)
 
 
+def _merge_multi_vlm_detections(main_detections, aux_detections):
+    """
+    合并主VLM和辅助VLM的检测结果（并集 + 同义词归一化 + 位置去重）
+
+    合并策略:
+      1. 按 frame_idx 分组，主模型已有该帧的以其为主
+      2. 对辅助模型检测到的物体:
+         - 若主模型已检测到同义类别（经merge_synonyms归一化后相同），跳过
+         - 若主模型未检测到（漏检），添加到该帧的 objects 列表
+         - 若同帧位置重复（中心距离<50px），仅保留主模型的检测
+
+    参数:
+        main_detections: [{frame_idx, frame_path, objects}]
+        aux_detections: [{frame_idx, frame_path, objects}]
+    返回:
+        合并后的 detections，结构同 main_detections
+    """
+    main_by_frame = {d["frame_idx"]: d for d in main_detections}
+
+    for aux_det in aux_detections:
+        fid = aux_det["frame_idx"]
+        if fid not in main_by_frame:
+            main_by_frame[fid] = {
+                "frame_idx": fid,
+                "frame_path": aux_det["frame_path"],
+                "objects": list(aux_det["objects"]),
+            }
+            continue
+
+        main_objs = main_by_frame[fid]["objects"]
+        main_std_names = set()
+        for obj in main_objs:
+            if "name" in obj:
+                main_std_names.add(merge_synonyms(obj["name"].lower().strip().replace(" ", "_")))
+
+        main_centers = []
+        for obj in main_objs:
+            if "center_x" in obj and "center_y" in obj:
+                main_centers.append((obj["center_x"], obj["center_y"]))
+
+        for aux_obj in aux_det.get("objects", []):
+            if "name" not in aux_obj:
+                continue
+            std = merge_synonyms(aux_obj["name"].lower().strip().replace(" ", "_"))
+            if std in main_std_names:
+                continue
+            if std in FILTER_CATEGORIES:
+                continue
+            ax = aux_obj.get("center_x")
+            ay = aux_obj.get("center_y")
+            if ax is not None and ay is not None:
+                if any((ax - mx) ** 2 + (ay - my) ** 2 < 50 ** 2 for mx, my in main_centers):
+                    continue
+            main_objs.append(aux_obj)
+            main_std_names.add(std)
+            if ax is not None and ay is not None:
+                main_centers.append((ax, ay))
+
+    merged = sorted(main_by_frame.values(), key=lambda d: d["frame_idx"])
+    return merged
+
+
 # ============================================================
 # JSON 解析工具
 # ============================================================
@@ -758,7 +820,7 @@ def _fix_json_string(json_str):
 # VLM 推理封装
 # ============================================================
 
-def _vlm_inference(image, model, processor, prompt, max_new_tokens=1024):
+def _vlm_inference(image, model, processor, prompt, max_new_tokens=1024, temperature=0.0, do_sample=False):
     """
     调用VLM进行单次推理（使用tokenize=True + enable_thinking=False）
 
@@ -767,7 +829,9 @@ def _vlm_inference(image, model, processor, prompt, max_new_tokens=1024):
         model: VLM模型
         processor: VLM处理器
         prompt: 提示词
-        max_new_tokens: 最大生成token数
+        max_new_tokens: 最大生成token数 (默认512，检测任务足够)
+        temperature: 采样温度 (默认0.0=贪心解码，结果稳定)
+        do_sample: 是否采样 (默认False=贪心，检测/分类任务推荐False)
     返回:
         VLM输出的文本
     """
@@ -790,8 +854,18 @@ def _vlm_inference(image, model, processor, prompt, max_new_tokens=1024):
         )
     inputs = inputs.to(model.device)
 
+    gen_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "pad_token_id": processor.tokenizer.eos_token_id,
+    }
+    if do_sample:
+        gen_kwargs["do_sample"] = True
+        gen_kwargs["temperature"] = max(temperature, 0.01)
+    else:
+        gen_kwargs["do_sample"] = False
+
     with torch.no_grad():
-        generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, pad_token_id=processor.tokenizer.eos_token_id)
+        generated_ids = model.generate(**inputs, **gen_kwargs)
 
     generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
     output_text = processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
@@ -882,14 +956,24 @@ def pixel_to_3d_position(u, v, extrinsic, intrinsic, world_points_frame, world_p
 # Step 3: 第一次VLM调用 — 物体检测（仅名称+位置）
 # ============================================================
 
-def detect_objects_in_frames(frame_paths_with_indices, model, processor):
+def detect_objects_in_frames(frame_paths_with_indices, model, processor, aux_model=None, aux_processor=None, enable_multi_vlm=False, aux_min_objects=8):
     """
     第一次VLM调用: 逐帧检测物体，只获取名称，不判断位置和关系
 
+    支持多VLM联合检测（可选）:
+      - 主模型对所有帧做检测
+      - 若主模型检测到的独立物体数 < aux_min_objects，触发辅助VLM补全
+      - 辅助VLM也做逐帧检测，结果与主模型合并（并集 + 同义词归一）
+      - 注意: 辅助模型不同时加载，检测完主模型后释放显存再加载
+
     参数:
         frame_paths_with_indices: [(vid_idx, frame_path), ...]
-        model: VLM模型
-        processor: VLM处理器
+        model: 主VLM模型
+        processor: 主VLM processor
+        aux_model: 辅助VLM模型 (可选, 高精度模型如32B)
+        aux_processor: 辅助VLM processor
+        enable_multi_vlm: 是否启用多VLM
+        aux_min_objects: 主模型独立物体数 < 该值时触发辅助VLM
     返回:
         [{"frame_idx", "frame_path", "objects": [{name}]}]
     """
@@ -901,7 +985,7 @@ def detect_objects_in_frames(frame_paths_with_indices, model, processor):
     total_objects = 0
 
     for i, (vid_idx, frame_path) in enumerate(frame_paths_with_indices):
-        print(f"[{i+1}/{len(frame_paths_with_indices)}] 分析帧 #{vid_idx}...", end=" ", flush=True)
+        print(f"[{i+1}/{len(frame_paths_with_indices)}] [主VLM] 帧 #{vid_idx}...", end=" ", flush=True)
 
         try:
             image = Image.open(frame_path).convert("RGB")
@@ -924,11 +1008,11 @@ def detect_objects_in_frames(frame_paths_with_indices, model, processor):
                     result = json.loads(json_str_fixed)
                 except json.JSONDecodeError as e2:
                     print(f"❌ JSON解析失败 ({elapsed:.1f}s)")
-                    print(f"   🔍 提取的JSON字符串 (前500字符): {json_str[:500]}", flush=True)
-                    print(f"   🔧 修复后JSON (前500字符): {json_str_fixed[:500]}", flush=True)
-                    print(f"   ⚠️  原始错误: {str(e1)[:200]}", flush=True)
-                    print(f"   ⚠️  修复后错误: {str(e2)[:200]}", flush=True)
-                    print(f"   📝 VLM完整输出:\n{output_text}", flush=True)
+                    print(f"      🔍 提取的JSON字符串 (前500字符): {json_str[:500]}", flush=True)
+                    print(f"      🔧 修复后JSON (前500字符): {json_str_fixed[:500]}", flush=True)
+                    print(f"      ⚠️  原始错误: {str(e1)[:200]}", flush=True)
+                    print(f"      ⚠️  修复后错误: {str(e2)[:200]}", flush=True)
+                    print(f"      📝 VLM完整输出:\n{output_text}", flush=True)
                     continue
 
             if isinstance(result, list):
@@ -964,12 +1048,102 @@ def detect_objects_in_frames(frame_paths_with_indices, model, processor):
             })
 
             obj_names = [obj["name"] for obj in valid_objects]
-            print(f"✅ 检测到 {len(valid_objects)} 个物体: {', '.join(obj_names)} ({elapsed:.1f}s)", flush=True)
+            print(f"✅ {len(valid_objects)}个: {', '.join(obj_names)} ({elapsed:.1f}s)", flush=True)
 
         except Exception as e:
             print(f"❌ 错误: {e}", flush=True)
 
-    print(f"\n📊 总计检测到 {total_objects} 个物体实例（跨 {len(all_detections)} 帧）\n", flush=True)
+    unique_main = set()
+    for det in all_detections:
+        for obj in det["objects"]:
+            std = merge_synonyms(obj["name"].lower().strip().replace(" ", "_")) if "name" in obj else None
+            if std and std not in FILTER_CATEGORIES:
+                unique_main.add(std)
+    print(f"\n📊 主VLM总计: {total_objects} 个物体实例, {len(unique_main)} 个独立类别", flush=True)
+
+    if enable_multi_vlm and aux_model is not None and aux_processor is not None and len(unique_main) < aux_min_objects:
+        print(f"\n{'='*70}", flush=True)
+        print(f"🤝 多VLM联合检测: 主VLM独立类别 {len(unique_main)} < {aux_min_objects}, 触发辅助VLM补全", flush=True)
+        print(f"{'='*70}\n", flush=True)
+
+        aux_detections = []
+        aux_total = 0
+        for i, (vid_idx, frame_path) in enumerate(frame_paths_with_indices):
+            print(f"[{i+1}/{len(frame_paths_with_indices)}] [辅VLM] 帧 #{vid_idx}...", end=" ", flush=True)
+            try:
+                image = Image.open(frame_path).convert("RGB")
+                start_time = time.time()
+                output_text = _vlm_inference(image, aux_model, aux_processor, VLM_DETECT_PROMPT, max_new_tokens=1024)
+                elapsed = time.time() - start_time
+
+                json_str = _extract_json_from_text(output_text)
+                if json_str is None:
+                    print(f"❌ 无法提取JSON ({elapsed:.1f}s)")
+                    continue
+
+                try:
+                    result = json.loads(json_str)
+                except json.JSONDecodeError:
+                    try:
+                        result = json.loads(_fix_json_string(json_str))
+                    except Exception:
+                        print(f"❌ JSON解析失败 ({elapsed:.1f}s)")
+                        continue
+
+                if isinstance(result, list):
+                    objects = result
+                else:
+                    objects = result.get("objects", result.get("detections", []))
+
+                img_w, img_h = image.size
+                for obj in objects:
+                    if not isinstance(obj, dict):
+                        continue
+                    if "label" in obj and "name" not in obj:
+                        obj["name"] = obj.pop("label")
+                    bbox = None
+                    if "bbox" in obj:
+                        bbox = obj["bbox"]
+                    elif "bbox_2d" in obj:
+                        bbox = obj["bbox_2d"]
+                    if bbox and isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+                        obj["center_x"] = (int(bbox[0]) + int(bbox[2])) // 2
+                        obj["center_y"] = (int(bbox[1]) + int(bbox[3])) // 2
+                        obj["bbox"] = [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])]
+                    if "center_x" not in obj or "center_y" not in obj:
+                        obj["center_x"] = img_w // 2
+                        obj["center_y"] = img_h // 2
+
+                valid_objects = [obj for obj in objects if "name" in obj]
+                aux_total += len(valid_objects)
+                aux_detections.append({
+                    "frame_idx": vid_idx,
+                    "frame_path": frame_path,
+                    "objects": valid_objects,
+                })
+
+                obj_names = [obj["name"] for obj in valid_objects]
+                print(f"✅ {len(valid_objects)}个: {', '.join(obj_names)} ({elapsed:.1f}s)", flush=True)
+            except Exception as e:
+                print(f"❌ 错误: {e}", flush=True)
+
+        unique_aux = set()
+        for det in aux_detections:
+            for obj in det["objects"]:
+                std = merge_synonyms(obj["name"].lower().strip().replace(" ", "_")) if "name" in obj else None
+                if std and std not in FILTER_CATEGORIES:
+                    unique_aux.add(std)
+        new_objects = unique_aux - unique_main
+        print(f"\n📊 辅助VLM总计: {aux_total} 个物体实例, {len(unique_aux)} 个独立类别", flush=True)
+        print(f"🆕 辅助VLM新发现: {len(new_objects)} 个 → {new_objects}", flush=True)
+
+        all_detections = _merge_multi_vlm_detections(all_detections, aux_detections)
+        print(f"🔗 合并后总物体实例: {sum(len(d['objects']) for d in all_detections)}", flush=True)
+    elif enable_multi_vlm and len(unique_main) >= aux_min_objects:
+        print(f"\n✅ 主VLM独立类别 {len(unique_main)} ≥ {aux_min_objects}, 跳过辅助VLM", flush=True)
+    elif enable_multi_vlm:
+        print(f"\n⚠️  多VLM已启用但未提供辅助模型, 跳过补全", flush=True)
+
     return all_detections
 
 
@@ -1219,12 +1393,17 @@ def supplementary_detect_from_pointcloud(vggt_results, unique_objects,
                   f"有效点数={valid_mask.sum()}", flush=True)
         
         # 使用动态阈值：50%分位数，但不低于0.1
+        # 注意用>=而非>，避免当中位数=最小值时排除大量点
         if valid_mask.any():
             conf_valid = conf_frame[valid_mask]
             threshold = max(np.percentile(conf_valid, 50), 0.1)
-            conf_mask = conf_frame > threshold
+            conf_mask = conf_frame >= threshold
+            # 如果阈值过滤后点太少(<100)，降低到25%分位数
+            if conf_mask.sum() < 100:
+                threshold = max(np.percentile(conf_valid, 25), 0.1)
+                conf_mask = conf_frame >= threshold
         else:
-            conf_mask = conf_frame > 0.1
+            conf_mask = conf_frame >= 0.1
         
         pts = world_points[t][conf_mask]
         if len(pts) > 0:
@@ -1258,7 +1437,10 @@ def supplementary_detect_from_pointcloud(vggt_results, unique_objects,
         for frame_idx, floor_mask in keyframe_floor_masks.items():
             if frame_idx < T:
                 try:
-                    fp = world_points[frame_idx][floor_mask]
+                    pointmap = world_points[frame_idx]
+                    # resize mask到pointmap尺寸，避免维度不匹配
+                    floor_mask_pm = _resize_mask_to_pointmap(floor_mask, pointmap)
+                    fp = pointmap[floor_mask_pm]
                     fp_ds = _voxel_downsample(fp, voxel_size=0.1)
                     for p in fp_ds:
                         floor_3d_points.add(tuple(np.floor(p / 0.1).astype(int)))
@@ -1280,7 +1462,7 @@ def supplementary_detect_from_pointcloud(vggt_results, unique_objects,
     # ---- 4. DBSCAN聚类 ----
     try:
         from sklearn.cluster import DBSCAN
-        clustering = DBSCAN(eps=0.15, min_samples=30).fit(all_points)
+        clustering = DBSCAN(eps=0.10, min_samples=20).fit(all_points)
         labels = clustering.labels_
     except ImportError:
         print("   ⚠️  sklearn不可用，使用简单体素聚类", flush=True)
@@ -1290,20 +1472,20 @@ def supplementary_detect_from_pointcloud(vggt_results, unique_objects,
         labels = inverse
 
     unique_labels = set(labels) - {-1}
-    print(f"   🔮 DBSCAN聚类: {len(unique_labels)} 个聚类", flush=True)
+    print(f"   🔮 DBSCAN聚类: {len(unique_labels)} 个聚类 (eps=0.10, min_samples=20, 阈值降低可发现小物体)", flush=True)
 
     # ---- 5. 过滤聚类 ----
     candidate_clusters = []
     for label in unique_labels:
         cluster_pts = all_points[labels == label]
-        if len(cluster_pts) < 50:
+        if len(cluster_pts) < 30:
             continue
 
         centroid = np.mean(cluster_pts, axis=0)
         bbox_extent = np.ptp(cluster_pts, axis=0)
         volume = float(np.prod(bbox_extent))
 
-        if volume < 0.005:
+        if volume < 0.002:
             continue
 
         if volume > 8.0:
@@ -1326,20 +1508,20 @@ def supplementary_detect_from_pointcloud(vggt_results, unique_objects,
         })
 
     candidate_clusters.sort(key=lambda x: x['volume'], reverse=True)
-    print(f"   ✅ 过滤后候选聚类: {len(candidate_clusters)} 个", flush=True)
+    print(f"   ✅ 过滤后候选聚类: {len(candidate_clusters)} 个 (阈值降低: vol<0.002, pts<30)", flush=True)
 
     if not candidate_clusters:
         print("   无显著遗漏聚类，跳过补充检测", flush=True)
         return []
 
-    for i, c in enumerate(candidate_clusters[:5]):
+    for i, c in enumerate(candidate_clusters[:10]):
         print(f"      候选{i+1}: 质心={c['centroid'].round(2)}, "
               f"尺寸={c['bbox_extent'].round(2)}, 体积={c['volume']:.3f}, "
               f"点数={c['point_count']}", flush=True)
 
     # ---- 6. VLM识别 ----
     new_objects = []
-    max_candidates = min(5, len(candidate_clusters))
+    max_candidates = min(8, len(candidate_clusters))
 
     for ci, cluster in enumerate(candidate_clusters[:max_candidates]):
         centroid = cluster['centroid']
@@ -1443,6 +1625,29 @@ def supplementary_detect_from_pointcloud(vggt_results, unique_objects,
 
 # ============================================================
 # Step 6: SAM 分割 floor 和 wall
+def _resize_mask_to_pointmap(mask, pointmap):
+    """将SAM mask resize到与VGGT pointmap相同的尺寸
+
+    SAM对原图分割的mask尺寸(如1080xW)与VGGT输出的pointmap尺寸(如518xW)不同，
+    直接用mask索引pointmap会导致boolean index维度不匹配错误。
+
+    参数:
+        mask: numpy (H_img, W_img) bool数组，SAM分割的mask
+        pointmap: numpy (H_pm, W_pm, 3) 数组，VGGT点云
+    返回:
+        numpy (H_pm, W_pm) bool数组，resize后的mask
+    """
+    target_h, target_w = pointmap.shape[:2]
+    if mask.shape[0] == target_h and mask.shape[1] == target_w:
+        return mask
+    # 用PIL resize：先转uint8再resize再转回bool
+    mask_img = Image.fromarray(mask.astype(np.uint8) * 255, mode='L')
+    mask_resized = mask_img.resize((target_w, target_h), Image.NEAREST)
+    return np.array(mask_resized) > 127
+
+
+# ============================================================
+# SAM floor/wall分割
 # ============================================================
 
 def segment_floor_and_wall_sam(frame_paths_with_indices, vggt_results):
@@ -1527,7 +1732,10 @@ def segment_floor_and_wall_sam(frame_paths_with_indices, vggt_results):
                 continue
 
             if len(kf_floor_masks) == 1:
-                chosen_mask = kf_floor_masks[0]['mask'].astype(bool)
+                m = np.atleast_2d(kf_floor_masks[0]['mask'])
+                if m.ndim == 3:
+                    m = m[0]
+                chosen_mask = m.astype(bool)
                 if np.sum(chosen_mask) > 500:
                     keyframe_floor_masks[vid_idx] = chosen_mask
                 continue
@@ -1539,10 +1747,15 @@ def segment_floor_and_wall_sam(frame_paths_with_indices, vggt_results):
                 for fm in kf_floor_masks:
                     if fm['frame_id'] != 0:
                         continue
-                    mask = fm['mask'].astype(bool)
+                    m = np.atleast_2d(fm['mask'])
+                    if m.ndim == 3:
+                        m = m[0]
+                    mask = m.astype(bool)
                     if np.sum(mask) <= 500:
                         continue
-                    info = get_plane_info(pointmap, mask)
+                    # resize mask到pointmap尺寸，避免维度不匹配
+                    mask_pm = _resize_mask_to_pointmap(mask, pointmap)
+                    info = get_plane_info(pointmap, mask_pm)
                     if info['mean_distance'] < 0.02:
                         plane_infos.append((mask, info))
 
@@ -1550,7 +1763,10 @@ def segment_floor_and_wall_sam(frame_paths_with_indices, vggt_results):
                     combined = np.zeros(img.shape[:2], dtype=bool)
                     for fm in kf_floor_masks:
                         if fm['frame_id'] == 0:
-                            combined |= fm['mask'].astype(bool)
+                            m = np.atleast_2d(fm['mask'])
+                            if m.ndim == 3:
+                                m = m[0]
+                            combined |= m.astype(bool)
                     if np.sum(combined) > 500:
                         keyframe_floor_masks[vid_idx] = combined
                     continue
@@ -1982,6 +2198,13 @@ def load_vlm_model(checkpoint_path):
     """
     加载VLM模型和处理器
 
+    支持的模型:
+      - Qwen3.5/Qwen3.6-27B-FP8 (AutoModelForImageTextToText)
+      - Qwen2.5-VL/Qwen3-VL 系列
+      - 通用 AutoModelForCausalLM 兜底
+
+    FP8 量化模型由 transformers >= 4.45 自动识别 (config.json 含 quantization_config)
+
     参数:
         checkpoint_path: 模型权重路径
     返回:
@@ -1994,8 +2217,53 @@ def load_vlm_model(checkpoint_path):
     processor = AutoProcessor.from_pretrained(checkpoint_path, trust_remote_code=True)
 
     print("   [2/2] 加载 Model...", flush=True)
-    model = AutoModelForVision2Seq.from_pretrained(
-        checkpoint_path, torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True
+    arch = ""
+    try:
+        from transformers import AutoConfig
+        cfg = AutoConfig.from_pretrained(checkpoint_path, trust_remote_code=True)
+        arch = "/".join(cfg.architectures) if cfg.architectures else ""
+        print(f"   架构: {arch}", flush=True)
+    except Exception as e:
+        print(f"   ⚠️ 读取 config 失败: {e}", flush=True)
+
+    ModelClass = None
+    if "ConditionalGeneration" in arch or "ForVision2Seq" in arch or "ForImageTextToText" in arch:
+        try:
+            from transformers import AutoModelForImageTextToText
+            ModelClass = AutoModelForImageTextToText
+            print(f"   使用 AutoModelForImageTextToText", flush=True)
+        except ImportError:
+            pass
+    if ModelClass is None:
+        try:
+            from transformers import AutoModelForVision2Seq
+            ModelClass = AutoModelForVision2Seq
+            print(f"   使用 AutoModelForVision2Seq (兼容旧版)", flush=True)
+        except ImportError:
+            pass
+    if ModelClass is None:
+        from transformers import AutoModelForCausalLM
+        ModelClass = AutoModelForCausalLM
+        print(f"   兜底使用 AutoModelForCausalLM", flush=True)
+
+    if torch.cuda.is_available():
+        gpu_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        gpu_budget = int(gpu_total * 0.85)
+        max_memory_map = {0: f"{gpu_budget}GiB", "cpu": "200GiB"}
+        print(f"   GPU 显存: {gpu_total:.1f} GiB, 分配: {gpu_budget} GiB (留15%给激活值)", flush=True)
+    else:
+        max_memory_map = {"cpu": "200GiB"}
+        print(f"   ⚠️  无 GPU, 全部加载到 CPU (推理会很慢)", flush=True)
+
+    os.makedirs("/tmp/vlm_offload", exist_ok=True)
+    model = ModelClass.from_pretrained(
+        checkpoint_path,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        trust_remote_code=True,
+        max_memory=max_memory_map,
+        offload_folder="/tmp/vlm_offload",
+        offload_state_dict=True,
     )
     model.eval()
 
@@ -2013,14 +2281,17 @@ def main():
     parser.add_argument('--input_video', type=str, required=True, help='输入视频路径')
     parser.add_argument('--output_json', type=str, default=None, help='输出 JSON 路径')
     parser.add_argument('--output_dir', type=str, default=None, help='输出目录 (保存关键帧和元数据, 默认与output_json同目录)')
-    parser.add_argument('--vlm_checkpoint', type=str, default=None, help='VLM 模型路径')
-    parser.add_argument('--max_frames', type=int, default=10, help='VGGT采样最大帧数 (SimRecon贪心采样)')
-    parser.add_argument('--vggt_max_frames', type=int, default=160, help='VGGT 3D重建最大帧数 (默认160, 与mainv2 --max_frames一致)')
+    parser.add_argument('--vlm_checkpoint', type=str, default=None, help='主VLM 模型路径 (快速模型, 用于检测)')
+    parser.add_argument('--vlm_checkpoint_aux', type=str, default=None, help='辅助VLM模型路径 (高精度模型, 如32B, 用于主模型漏检物体补全, 可选)')
+    parser.add_argument('--max_frames', type=int, default=12, help='贪心采样关键帧数 (默认12, 提高视角覆盖度)')
+    parser.add_argument('--vggt_max_frames', type=int, default=120, help='VGGT 3D重建最大帧数 (默认120, 室内场景足够且提速25%)')
     parser.add_argument('--temp_dir', type=str, default='./temp_frames_stage2', help='临时帧目录')
     parser.add_argument('--centroid_dist_thre', type=float, default=0.15, help='3D去重质心距离阈值/米')
     parser.add_argument('--use_sam', type=str, default='auto', choices=['auto', 'yes', 'no'], help='SAM3 floor/wall分割')
     parser.add_argument('--supplementary_detect', action='store_true', default=True, help='启用点云补充检测（发现远端大物体）')
     parser.add_argument('--no_supplementary_detect', action='store_true', default=False, help='禁用点云补充检测')
+    parser.add_argument('--enable_multi_vlm', action='store_true', default=False, help='启用多VLM联合检测 (主+辅模型, 需要同时设置vlm_checkpoint_aux)')
+    parser.add_argument('--aux_min_object_threshold', type=int, default=8, help='主模型检测物体数<该值时触发辅助VLM补全 (默认8)')
 
     args = parser.parse_args()
 
@@ -2035,10 +2306,31 @@ def main():
         args.output_dir = os.path.dirname(os.path.abspath(args.output_json))
 
     if args.vlm_checkpoint is None:
-        default_model = "/mnt/data/lza/models/Qwen3.5-9B"
-        if os.path.exists(default_model):
-            args.vlm_checkpoint = default_model
-        else:
+        candidates_fast = [
+            "/mnt/data/lza/models/Qwen3.5-9B",
+            "/mnt/data/lza/models/Qwen3.5-7B",
+        ]
+        for cand in candidates_fast:
+            if os.path.exists(cand):
+                args.vlm_checkpoint = cand
+                print(f"   ✅ 默认使用快速模型: {cand} (~18GB, 全部加载到GPU, 推理快)", flush=True)
+                break
+
+        if args.vlm_checkpoint is None:
+            candidates_high_precision = [
+                "/mnt/data/lza/models/Qwen3.6-27B-FP8",
+                "/mnt/data/lza/models/Qwen3.5-32B",
+                "/mnt/data/lza/models/Qwen2.5-VL-32B-Instruct",
+                "/mnt/data/lza/models/Qwen3-32B",
+                "/mnt/data/lza/models/models--Qwen--Qwen2.5-VL-32B-Instruct",
+            ]
+            for cand in candidates_high_precision:
+                if os.path.exists(cand):
+                    args.vlm_checkpoint = cand
+                    print(f"   ⚠️  9B不可用, 改用高精度模型: {cand} (可能需CPU offload, 速度较慢)", flush=True)
+                    break
+
+        if args.vlm_checkpoint is None:
             fallback = "/mnt/data/lza/models/models--Qwen--Qwen2.5-VL-3B-Instruct"
             if os.path.exists(fallback):
                 snapshots_dir = os.path.join(fallback, "snapshots")
@@ -2046,10 +2338,24 @@ def main():
                     snapshots = [d for d in os.listdir(snapshots_dir) if os.path.isdir(os.path.join(snapshots_dir, d))]
                     if snapshots:
                         args.vlm_checkpoint = os.path.join(snapshots_dir, snapshots[0])
+                        print(f"   ⚠️  9B/高精度都不可用，回退到 3B: {args.vlm_checkpoint}", flush=True)
 
     if args.vlm_checkpoint is None:
         print("❌ 错误: 未找到 VLM 模型", flush=True)
         return
+
+    if args.vlm_checkpoint_aux is None:
+        if "9b" in args.vlm_checkpoint.lower() or "7b" in args.vlm_checkpoint.lower() or "3b" in args.vlm_checkpoint.lower():
+            aux_candidates = [
+                "/mnt/data/lza/models/Qwen3.6-27B-FP8",
+                "/mnt/data/lza/models/Qwen3.5-32B",
+                "/mnt/data/lza/models/Qwen2.5-VL-32B-Instruct",
+            ]
+            for cand in aux_candidates:
+                if cand != args.vlm_checkpoint and os.path.exists(cand):
+                    args.vlm_checkpoint_aux = cand
+                    print(f"   💡 主VLM较小, 已配高精度辅助: {cand} (需 --enable_multi_vlm 触发)", flush=True)
+                    break
 
     print("=" * 70, flush=True)
     print("🚀 ReplicateAnyScene Stage 2: VGGT引导的智能物体发现", flush=True)
@@ -2057,8 +2363,14 @@ def main():
     print(f"📥 输入视频: {args.input_video}")
     print(f"📤 输出 JSON: {args.output_json}")
     print(f"📂 输出目录: {args.output_dir}")
-    print(f"🤖 VLM模型: {args.vlm_checkpoint}")
-    print(f"🖼️  最大帧数: {args.max_frames}")
+    print(f"🤖 主VLM模型: {args.vlm_checkpoint}")
+    if args.enable_multi_vlm:
+        if args.vlm_checkpoint_aux:
+            print(f"🤖 辅助VLM模型: {args.vlm_checkpoint_aux}")
+        else:
+            print(f"⚠️  启用多VLM但未找到辅助模型, 仅使用主模型", flush=True)
+    print(f"🖼️  贪心采样帧数: {args.max_frames}")
+    print(f"🖼️  VGGT重建帧数: {args.vggt_max_frames}")
     print("=" * 70 + "\n", flush=True)
 
     try:
@@ -2101,7 +2413,51 @@ def main():
 
         # Step 3: 第一次VLM调用 — 物体检测（仅名称+位置）
         model, processor = load_vlm_model(args.vlm_checkpoint)
-        all_detections = detect_objects_in_frames(frame_paths_with_indices, model, processor)
+
+        aux_model, aux_processor = None, None
+        if args.enable_multi_vlm and args.vlm_checkpoint_aux and os.path.exists(args.vlm_checkpoint_aux):
+            print(f"\n🤝 多VLM模式: 检测完主模型后, 将在主VLM独立物体<阈值时加载辅助VLM", flush=True)
+            print(f"   主VLM: {args.vlm_checkpoint}", flush=True)
+            print(f"   辅助VLM (按需): {args.vlm_checkpoint_aux}", flush=True)
+
+        all_detections = detect_objects_in_frames(
+            frame_paths_with_indices, model, processor,
+            aux_model=aux_model, aux_processor=aux_processor,
+            enable_multi_vlm=args.enable_multi_vlm and args.vlm_checkpoint_aux is not None,
+            aux_min_objects=args.aux_min_object_threshold,
+        )
+
+        if args.enable_multi_vlm and args.vlm_checkpoint_aux and os.path.exists(args.vlm_checkpoint_aux):
+            unique_count = 0
+            seen = set()
+            for det in all_detections:
+                for obj in det["objects"]:
+                    if "name" in obj:
+                        std = merge_synonyms(obj["name"].lower().strip().replace(" ", "_"))
+                        if std and std not in FILTER_CATEGORIES and std not in seen:
+                            seen.add(std)
+                            unique_count += 1
+            if unique_count < args.aux_min_object_threshold:
+                print(f"\n🤝 加载辅助VLM进行补全 (主模型独立类别 {unique_count} < {args.aux_min_object_threshold})", flush=True)
+                del model, processor
+                torch.cuda.empty_cache()
+
+                aux_model, aux_processor = load_vlm_model(args.vlm_checkpoint_aux)
+                all_detections = detect_objects_in_frames(
+                    frame_paths_with_indices, aux_model, aux_processor,
+                    aux_model=None, aux_processor=None,
+                    enable_multi_vlm=False, aux_min_objects=0,
+                )
+                model, processor = aux_model, aux_processor
+                print(f"\n✅ Step 7 关系判断将使用辅助VLM (高精度)", flush=True)
+            else:
+                print(f"\n✅ 主VLM独立类别 {unique_count} ≥ {args.aux_min_object_threshold}, 无需辅助VLM", flush=True)
+        elif args.vlm_checkpoint_aux and os.path.exists(args.vlm_checkpoint_aux) \
+                and args.vlm_checkpoint_aux != args.vlm_checkpoint:
+            is_32b_main = "32b" in args.vlm_checkpoint.lower()
+            is_9b_aux = "9b" in args.vlm_checkpoint_aux.lower() or "7b" in args.vlm_checkpoint_aux.lower()
+            if is_32b_main and is_9b_aux:
+                print(f"\nℹ️  当前主VLM(32B)已足够, 跳过辅助VLM(9B). 如需强制启用, 加 --enable_multi_vlm", flush=True)
 
         if not all_detections:
             print("❌ 未能检测到任何物体", flush=True)

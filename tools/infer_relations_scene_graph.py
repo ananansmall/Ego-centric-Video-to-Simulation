@@ -239,13 +239,12 @@ Think about what objects are ATTACHED TO WALL (hanging/fixed on vertical surface
 - ONLY these types: picture, painting, photo frame, mirror, clock, poster, whiteboard, TV (wall-mounted), window, door, curtain rod, light switch, outlet
 - Curtains are attached to wall (via curtain rod)
 
-### Step 4: Identify HELD objects (held by hand)
-Think about what objects are BEING HELD BY A PERSON'S HAND:
-- Tools: hammer, scissors, screwdriver, wrench, knife
-- Small handheld items: phone, remote, pen, cup (when held), bottle
-- Toys being played with
-- If an object is clearly in someone's hand (not resting on any surface), mark it as "held"
-- parent=0 for held objects (no spatial parent)
+### Step 4: Handle objects not on any surface
+For objects that appear to be held by a person or floating in mid-air:
+- Think about where the object would NATURALLY REST if not held
+- If it's a small object that belongs on a table/desk → parent = that furniture's ID, relation = "support"
+- If it's a large object that belongs on the floor → parent = 1, relation = "support"
+- Do NOT use relation="held" — always assign a physical support relation based on where the object belongs
 
 ## PHYSICAL COMMON SENSE RULES:
 1. **Cabinets, wardrobes, bookshelves** → ALWAYS supported by floor (parent=1), NOT attached to wall!
@@ -253,23 +252,23 @@ Think about what objects are BEING HELD BY A PERSON'S HAND:
 3. **Wall-attached** is RARE, only for: pictures, mirrors, clocks, posters, wall-mounted TVs, curtains, windows, doors
 4. **Objects on furniture** → parent is that furniture's ID, relation is "support"
 5. **Small items on desk** (lamp, monitor, keyboard, cup) → supported by desk
-6. **Objects held by hand** → relation="held", parent=0. Do NOT place them on floor or table!
-7. **If an object is floating in mid-air** (not on any surface), it is likely being held → relation="held", parent=0
+6. **Objects held by hand or floating** → assign their NATURAL support relation (where they belong when not held), NOT relation="held"
+7. **If unsure**, default to: relation="support", parent=1 (floor)
 
 ## OUTPUT FORMAT:
 ```json
 {{
   "objects": [
-    {{"id": <display_id>, "category": "<name>", "relation": "support|attached|held", "parent": <parent_id>}}
+    {{"id": <display_id>, "category": "<name>", "relation": "support|attached", "parent": <parent_id>}}
   ]
 }}
 ```
-Where parent_id: 0=held by hand, 1=floor, 2=wall, or another object's display_id.
+Where parent_id: 1=floor, 2=wall, or another object's display_id.
 
 ## CRITICAL REQUIREMENTS:
 - You MUST output exactly {num_objects} objects (one for each ID: {display_ids_str})
 - Do NOT skip any object!
-- If an object is being held by a hand, use relation="held", parent=0
+- Do NOT use relation="held" — every object must have a physical support relation
 - If unsure and the object appears to be resting on a surface, default to: relation="support", parent=1 (floor)
 
 Now analyze the image and output the complete JSON with all {num_objects} objects.
@@ -298,7 +297,7 @@ Now analyze the image and output the complete JSON with all {num_objects} object
     inputs = inputs.to(model.device)
 
     with torch.no_grad():
-        generated_ids = model.generate(**inputs, max_new_tokens=32768)
+        generated_ids = model.generate(**inputs, max_new_tokens=1024)
 
     generated_ids_trimmed = [
         out_ids[len(in_ids):]
@@ -396,6 +395,8 @@ def convert_scene_graph_to_relations(
       1. 只修改 "supported by other objects" 的物体关系
       2. 已确定的关系 (floor/wall/embedded/attached) 不改变
       3. 如果VLM判断不出具体关系, 保持原样 "supported by other objects"
+      4. 生成 per-instance 关系键 (如 "toy_0", "toy_1")，同一类别不同实例可有不同关系
+      5. 同时保留 category-level 键 (如 "toy")，值为该类别最常见的关系
 
     参数:
         objects: VLM推断的物体列表 [{id, category, relation, parent}, ...]
@@ -403,7 +404,7 @@ def convert_scene_graph_to_relations(
         original_relations: 原始的 categories_and_relations
         display_id_offset: 显示ID偏移
     返回:
-        更新后的 categories_and_relations
+        更新后的 categories_and_relations (包含 category-level 和 instance-level 键)
     """
     id_to_object = {}
     for obj in objects:
@@ -416,6 +417,7 @@ def convert_scene_graph_to_relations(
 
     refined_relations = dict(original_relations)
 
+    instance_relations = {}
     for obj in objects:
         obj_id = obj['id']
         relation = obj['relation']
@@ -429,22 +431,61 @@ def convert_scene_graph_to_relations(
         if original_relations.get(category) != "supported by other objects":
             continue
 
-        if parent_id == 0 and relation == 'held':
-            refined_relations[category] = "held by hand"
+        if parent_id == 0:
+            continue
         elif parent_id == 1 and relation == 'support':
-            refined_relations[category] = "supported by floor"
+            rel_str = "supported by floor"
         elif parent_id == 2 and relation == 'attached':
             cat_lower = category.lower()
             if any(w in cat_lower for w in ['window', 'door']):
-                refined_relations[category] = "embedded in wall"
+                rel_str = "embedded in wall"
             else:
-                refined_relations[category] = "attached to wall"
+                rel_str = "attached to wall"
         elif parent_id in display_id_to_category_instance:
-            parent_category, _ = display_id_to_category_instance[parent_id]
+            parent_category, parent_inst_idx = display_id_to_category_instance[parent_id]
+            parent_n_instances = len(category_to_display_ids.get(parent_category, []))
             if relation == 'support':
-                refined_relations[category] = f"supported by {parent_category}"
+                if parent_n_instances > 1:
+                    rel_str = f"supported by {parent_category}_{parent_inst_idx}"
+                else:
+                    rel_str = f"supported by {parent_category}"
             elif relation == 'attached':
-                refined_relations[category] = f"attached to {parent_category}"
+                if parent_n_instances > 1:
+                    rel_str = f"attached to {parent_category}_{parent_inst_idx}"
+                else:
+                    rel_str = f"attached to {parent_category}"
+            else:
+                continue
+        else:
+            continue
+
+        instance_relations[(category, inst_idx)] = rel_str
+
+    for category in category_to_display_ids:
+        if original_relations.get(category) != "supported by other objects":
+            continue
+
+        cat_instance_rels = {}
+        for (cat, idx), rel in instance_relations.items():
+            if cat == category:
+                cat_instance_rels[idx] = rel
+
+        if not cat_instance_rels:
+            continue
+
+        n_instances = len(category_to_display_ids[category])
+        for idx, rel in cat_instance_rels.items():
+            inst_key = f"{category}_{idx}"
+            refined_relations[inst_key] = rel
+
+        if n_instances == 1:
+            only_rel = list(cat_instance_rels.values())[0]
+            refined_relations[category] = only_rel
+        else:
+            from collections import Counter
+            rel_counts = Counter(cat_instance_rels.values())
+            most_common_rel = rel_counts.most_common(1)[0][0]
+            refined_relations[category] = most_common_rel
 
     return refined_relations
 
