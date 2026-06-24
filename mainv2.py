@@ -171,7 +171,7 @@ from src.vggt_predict import vggt_predict
 from src.vggt_omega_predict import vggt_omega_predict
 from src.vggt4d_predict import vggt4d_predict
 from src.object_segmentation import segment_wall_and_floor, segment_and_track
-from src.sg_deduplication import self_category_deduplicate, cross_category_deduplicate
+from src.sg_deduplication import self_category_deduplicate, cross_category_deduplicate, deduplicate_3d_assets
 from src.instance_generation import generate_3d_asset_in_subprocess
 from src.sp_refinement import (
     refine_supported_by_floor_object,
@@ -200,7 +200,7 @@ def _resolve_vlm_checkpoint(checkpoint_arg):
     return None
 
 
-def run_stage1(input_video, output_path, vlm_checkpoint, max_frames_stage1=10, vggt_max_frames=160):
+def run_stage1(input_video, output_path, vlm_checkpoint, max_frames_stage1=12, vggt_max_frames=120):
     """
     Stage 1: VGGT引导的智能物体发现 → 场景JSON
 
@@ -226,6 +226,7 @@ def run_stage1(input_video, output_path, vlm_checkpoint, max_frames_stage1=10, v
     print("\n" + "=" * 70, flush=True)
     print("🚀 Stage 1: VGGT引导的智能物体发现", flush=True)
     print("=" * 70, flush=True)
+    _s1_start = time.time()
 
     scene_id = os.path.splitext(os.path.basename(input_video))[0]
     stage1_json = os.path.join(output_path, f"scene_{scene_id}_stage1.json")
@@ -286,14 +287,14 @@ def run_stage1(input_video, output_path, vlm_checkpoint, max_frames_stage1=10, v
         print(f"   ⚠️ keyframes 目录不存在: {source_keyframes} 和 {target_keyframes}", flush=True)
         print(f"   ⚠️ 后续 VLM 帧投票可能无法使用 keyframes 来源", flush=True)
 
-    print(f"✅ Stage 1 完成: {len(categories_and_relations)} 个物体", flush=True)
+    print(f"✅ Stage 1 完成: {len(categories_and_relations)} 个物体 ({time.time()-_s1_start:.1f}s)", flush=True)
     for name, rel in sorted(categories_and_relations.items()):
         print(f"   {name}: {rel}", flush=True)
 
     return stage1_json, categories_and_relations
 
 
-def run_stage2(input_video, output_path, categories_and_relations, max_frames=160, vggt_model_type="vggt"):
+def run_stage2(input_video, output_path, categories_and_relations, max_frames=120, vggt_model_type="vggt"):
     """
     Stage 2: VGGT 3D重建 + SAM3空间去重 (与main.py一致)
 
@@ -318,6 +319,7 @@ def run_stage2(input_video, output_path, categories_and_relations, max_frames=16
     print("\n" + "=" * 70, flush=True)
     print("🚀 Stage 2: VGGT 3D重建 + SAM3空间去重", flush=True)
     print("=" * 70, flush=True)
+    _s2_start = time.time()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     detected_categories = list(categories_and_relations.keys())
@@ -398,6 +400,7 @@ def run_stage2(input_video, output_path, categories_and_relations, max_frames=16
             category_masks,
             vggt_prediction_results['world_points'],
             vggt_prediction_results['world_points_conf'],
+            category_name=category,
         )
         all_masks[category] = deduplicated_category_masks
 
@@ -407,7 +410,6 @@ def run_stage2(input_video, output_path, categories_and_relations, max_frames=16
         all_masks,
         vggt_prediction_results['world_points'],
         vggt_prediction_results['world_points_conf'],
-        protected_categories=json_categories_set,
     )
 
     # JSON白名单过滤: 只保留Stage1发现的类别
@@ -426,7 +428,7 @@ def run_stage2(input_video, output_path, categories_and_relations, max_frames=16
     )
     sam3_video_model = unload_model(sam3_video_model)
 
-    print(f"✅ Stage 2 完成", flush=True)
+    print(f"✅ Stage 2 完成 ({time.time()-_s2_start:.1f}s)", flush=True)
     return vggt_prediction_results, deduplicated_all_masks, wall_masks, floor_masks
 
 
@@ -450,6 +452,7 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
     print("\n" + "=" * 70, flush=True)
     print("🚀 Stage 3: 最优视角资产生成", flush=True)
     print("=" * 70, flush=True)
+    _s3_start = time.time()
 
     # 计算每个实例的最优视角帧ID
     all_optimal_frame_ids = {}
@@ -556,6 +559,20 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
                     instance_info["T"] = T
                     print(f"   {category}_{inst_idx}: [DYNAMIC] 位置调整: mesh帧{optimal_frame_id} → 首次可见帧{first_visible_frame_id}, offset={np.linalg.norm(offset):.4f}m", flush=True)
 
+    # 3D Mesh 去重: 在生成后二次检查，移除重复3D资产
+    all_instances, deduplicated_all_masks, mesh_dedup_removed = deduplicate_3d_assets(
+        all_instances, all_masks=deduplicated_all_masks
+    )
+    if mesh_dedup_removed:
+        all_optimal_frame_ids = {}
+        for category, category_masks in deduplicated_all_masks.items():
+            all_optimal_frame_ids[category] = []
+            for instance_masks in category_masks:
+                optimal_fid, _, _ = get_optimal_view_frame_id(
+                    vggt_prediction_results['world_points'], instance_masks
+                )
+                all_optimal_frame_ids[category].append(optimal_fid)
+
     # Stage 3.5: 多票验证生成的3D资产
     from tools.asset_verifier import verify_all_instances
     all_instances = verify_all_instances(
@@ -567,60 +584,68 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
         min_votes=2,
     )
 
-    print(f"✅ Stage 3 完成", flush=True)
-    return all_instances, all_optimal_frame_ids
+    print(f"✅ Stage 3 完成 ({time.time()-_s3_start:.1f}s)", flush=True)
+    return all_instances, all_optimal_frame_ids, deduplicated_all_masks
 
 
 def run_stage4(output_path, vggt_prediction_results, all_instances, args,
-               categories_and_relations=None, walls_info=None):
+               categories_and_relations=None, walls_info=None,
+               deduplicated_all_masks=None):
     """
     Stage 4: 迭代视觉-空间对齐 (可选，默认关闭)
 
-    流程:
-      1. 从VGGT数据重建世界点云
-      2. 基于深度图创建实例mask
-      3. 对每个实例执行2D-3D对应关系对齐:
-         - Phase A: MASt3R/深度匹配 → Umeyama变换
+    流程 (对齐论文 Section 3.4):
+      1. 使用VGGT世界点云 + 置信度
+      2. 使用SAM分割mask作为real mask (论文方法)，无SAM mask时回退到深度比较
+      3. 对每个实例执行render-match-optimize迭代对齐:
+         - Phase A: MASt3R/深度匹配 → 3D Lifting → Umeyama相似变换(含尺度)
          - Phase B: ICP精调 → 渐进阈值+RANSAC
 
     参数:
         output_path: 输出目录
-        vggt_prediction_results: VGGT预测结果
+        vggt_prediction_results: VGGT预测结果 (含 world_points, world_points_conf)
         all_instances: 3D资产实例
         args: 命令行参数（stage4_iterations, stage4_temporal_radius等）
+        deduplicated_all_masks: SAM分割mask (论文的 M_real), {category: [instance_masks]}
     返回:
         对齐后的 all_instances
     """
     print("\n" + "=" * 70, flush=True)
     print("🚀 Stage 4: 迭代视觉-空间对齐", flush=True)
     print("=" * 70, flush=True)
+    _s4_start = time.time()
 
     from stage4.run_alignment import (
-        reconstruct_world_points,
         create_depth_based_masks,
         compute_optimal_frame_ids,
     )
     from stage4.combined_alignment import refine_single_instance_combined
 
-    # 从VGGT深度+外参重建世界点云
-    vggt = {
-        'depths': vggt_prediction_results['depths'],
-        'extrinsics': vggt_prediction_results['extrinsics'],
-        'intrinsic': vggt_prediction_results['intrinsic'],
-        'colors': vggt_prediction_results['colors'],
-    }
-    world_points = reconstruct_world_points(
-        vggt['depths'], vggt['extrinsics'], vggt['intrinsic']
-    )
-    world_points_conf = np.ones_like(vggt['depths'], dtype=np.float32)
-    vggt['world_points'] = world_points
-    vggt['world_points_conf'] = world_points_conf
+    # 使用VGGT原始世界点云和置信度 (论文方法，不再重新计算/禁用置信度)
+    world_points = vggt_prediction_results['world_points']
+    world_points_conf = vggt_prediction_results.get(
+        'world_points_conf', np.ones_like(vggt_prediction_results['depths'], dtype=np.float32))
+    print(f"   使用 VGGT world_points_conf (min={world_points_conf.min():.3f}, "
+          f"mean={world_points_conf.mean():.3f}, max={world_points_conf.max():.3f})", flush=True)
 
-    # 基于深度图创建实例mask
-    all_masks = create_depth_based_masks(
-        all_instances, vggt['depths'], vggt['extrinsics'],
-        vggt['intrinsic'], world_points,
-    )
+    # 使用SAM分割mask作为real mask (论文方法 M_real,v)
+    # SAM mask是固定的真实物体轮廓，不随当前位姿变化，避免循环依赖
+    use_sam_masks = (deduplicated_all_masks is not None
+                     and set(deduplicated_all_masks.keys()) == set(all_instances.keys())
+                     and all(len(deduplicated_all_masks.get(c, [])) == len(insts)
+                             for c, insts in all_instances.items()))
+
+    if use_sam_masks:
+        print(f"   使用 SAM 分割 mask (论文方法 M_real)", flush=True)
+        all_masks = deduplicated_all_masks
+    else:
+        print(f"   [Warning] SAM mask 与 all_instances 不匹配，回退到深度比较 mask", flush=True)
+        all_masks = create_depth_based_masks(
+            all_instances, vggt_prediction_results['depths'],
+            vggt_prediction_results['extrinsics'],
+            vggt_prediction_results['intrinsic'], world_points,
+        )
+
     all_optimal_frame_ids = compute_optimal_frame_ids(all_masks, world_points)
 
     total_instances = sum(len(insts) for insts in all_instances.values())
@@ -654,10 +679,10 @@ def run_stage4(output_path, vggt_prediction_results, all_instances, args,
                 optimal_frame_id=opt_fid,
                 world_points=world_points,
                 world_points_conf=world_points_conf,
-                depths=vggt['depths'],
-                extrinsics=vggt['extrinsics'],
-                intrinsic=vggt['intrinsic'],
-                colors=vggt['colors'],
+                depths=vggt_prediction_results['depths'],
+                extrinsics=vggt_prediction_results['extrinsics'],
+                intrinsic=vggt_prediction_results['intrinsic'],
+                colors=vggt_prediction_results['colors'],
                 num_icp_iterations=args.stage4_iterations,
                 temporal_radius=args.stage4_temporal_radius,
                 instance_index=current_instance,
@@ -672,7 +697,7 @@ def run_stage4(output_path, vggt_prediction_results, all_instances, args,
             cat_insts[iid] = inst
             current_instance += 1
 
-    print(f"✅ Stage 4 完成", flush=True)
+    print(f"✅ Stage 4 完成 ({time.time()-_s4_start:.1f}s)", flush=True)
     return all_instances
 
 
@@ -700,6 +725,7 @@ def run_stage5(output_path, categories_and_relations, all_instances,
     refined_relations = dict(categories_and_relations)
 
     # ── 5.1: 关系推断 ──
+    _t51 = time.time()
     if stage5_method == "scene_graph":
         print("\n   📍 5.1: 场景图关系推断 (SimRecon风格)", flush=True)
         from tools.infer_relations_scene_graph import infer_relations_scene_graph
@@ -733,8 +759,11 @@ def run_stage5(output_path, categories_and_relations, all_instances,
             )
         else:
             print("\n   📍 5.1: 无 'supported by other objects' 关系，跳过细化", flush=True)
+    _t51_time = time.time() - _t51
+    print(f"   ⏱️ 5.1 耗时: {_t51_time:.1f}s", flush=True)
 
     # ── 5.2: 几何精修 (只修改 "supported by <物体>" 的物体, 已精修的floor/wall不动) ──
+    _t52 = time.time()
     has_inter_object = any(
         rel.startswith("supported by ") and "floor" not in rel and "other objects" not in rel
         for rel in refined_relations.values()
@@ -752,6 +781,8 @@ def run_stage5(output_path, categories_and_relations, all_instances,
         )
     else:
         print("\n   📍 5.2: 无物体间支撑关系，跳过精修", flush=True)
+    _t52_time = time.time() - _t52
+    print(f"   ⏱️ 5.2 耗时: {_t52_time:.1f}s", flush=True)
 
     print(f"✅ Stage 5 完成", flush=True)
     return all_instances, refined_relations
@@ -775,6 +806,17 @@ def save_final_glb(all_instances, output_path, filename="final_scene.glb"):
         GLB文件路径
     """
     scene = trimesh.Scene()
+
+    # 添加虚拟水平面标注 (z=0处的网格线, 不遮挡物体)
+    grid_lines = []
+    grid_range = 5.0
+    grid_step = 0.5
+    for v in np.arange(-grid_range, grid_range + grid_step, grid_step):
+        grid_lines.append(trimesh.load_path(np.array([[v, -grid_range, 0], [v, grid_range, 0]])))
+        grid_lines.append(trimesh.load_path(np.array([[-grid_range, v, 0], [grid_range, v, 0]])))
+    grid = trimesh.util.concatenate(grid_lines)
+    scene.add_geometry(grid, node_name="grid_z0")
+
     for category, category_instances in all_instances.items():
         for i, instance_info in enumerate(category_instances):
             mesh = instance_info['original_mesh']
@@ -792,6 +834,56 @@ def save_final_glb(all_instances, output_path, filename="final_scene.glb"):
     scene.export(glb_path)
     print(f"💾 GLB 已保存: {glb_path}", flush=True)
     return glb_path
+
+
+def _record_pose_stage(all_instances, relations, stage_name, pose_history=None):
+    """
+    记录当前阶段每个物体的位姿到 pose_history
+
+    Args:
+        all_instances: {category: [instance_info, ...]}
+        relations: {category: relationship}
+        stage_name: 阶段名称 (initial / basic_refinement / stage5)
+        pose_history: 已有的位姿历史 (None则新建)
+    Returns:
+        更新后的 pose_history
+    """
+    if pose_history is None:
+        pose_history = {}
+
+    for category, category_instances in all_instances.items():
+        for inst_idx, info in enumerate(category_instances):
+            key = f"{category}_{inst_idx}"
+            T = info["T"]
+            mesh = info["original_mesh"]
+            transformed = mesh.copy()
+            transformed.apply_transform(T)
+
+            if key not in pose_history:
+                pose_history[key] = {
+                    "category": category,
+                    "instance_idx": inst_idx,
+                    "relation": relations.get(category, "unknown"),
+                    "stages": {},
+                }
+
+            pose_history[key]["stages"][stage_name] = {
+                "T_matrix": T.tolist(),
+                "position": T[:3, 3].tolist(),
+                "bounds_min": transformed.bounds[0].tolist(),
+                "bounds_max": transformed.bounds[1].tolist(),
+                "center": transformed.bounds.mean(axis=0).tolist(),
+            }
+
+            prev_stages = list(pose_history[key]["stages"].keys())
+            if len(prev_stages) >= 2:
+                prev_stage = prev_stages[-2]
+                prev_pos = np.array(pose_history[key]["stages"][prev_stage]["position"])
+                curr_pos = np.array(pose_history[key]["stages"][stage_name]["position"])
+                delta = curr_pos - prev_pos
+                pose_history[key]["stages"][stage_name]["delta_from_" + prev_stage] = delta.tolist()
+
+    return pose_history
 
 
 def main(args):
@@ -858,25 +950,51 @@ def main(args):
     print(f"🤖 VLM模型: {vlm_checkpoint}", flush=True)
 
     # ── Stage 1: VGGT引导的智能物体发现 ──
+    _t1 = time.time()
     stage1_json, categories_and_relations = run_stage1(
         args.input_video, args.output_path, vlm_checkpoint,
         max_frames_stage1=args.max_frames_stage1,
         vggt_max_frames=args.max_frames,
     )
+    _stage1_time = time.time() - _t1
 
     # ── Stage 2: VGGT 3D重建 + SAM3空间去重 ──
+    _t2 = time.time()
     vggt_prediction_results, deduplicated_all_masks, wall_masks, floor_masks = run_stage2(
         args.input_video, args.output_path, categories_and_relations,
         max_frames=args.max_frames, vggt_model_type=args.vggt_model,
     )
+    _stage2_time = time.time() - _t2
 
     # ── Stage 3: 最优视角资产生成 + 多票验证 ──
-    all_instances, all_optimal_frame_ids = run_stage3(
+    _t3 = time.time()
+    all_instances, all_optimal_frame_ids, deduplicated_all_masks = run_stage3(
         args.output_path, vggt_prediction_results, deduplicated_all_masks,
     )
+    _stage3_time = time.time() - _t3
 
     # ── 基础精修: floor/wall/embedded (始终执行，与main.py一致，在Stage4之前) ──
+    _t_base = time.time()
     walls_info = get_walls_info(vggt_prediction_results['world_points'], wall_masks)
+
+    # 同步 categories_and_relations: 移除在去重/3D资产生成中丢失的类别
+    surviving_categories = set(all_instances.keys())
+    lost_categories = set(categories_and_relations.keys()) - surviving_categories
+    if lost_categories:
+        print(f"\n⚠️  以下类别在去重/3D生成中丢失，从 categories_and_relations 中移除:", flush=True)
+        for cat in sorted(lost_categories):
+            print(f"    🚫 {cat}: {categories_and_relations[cat]}", flush=True)
+        categories_and_relations = {k: v for k, v in categories_and_relations.items() if k in surviving_categories}
+
+    print(f"\n{'='*70}", flush=True)
+    print(f"🔧 基础精修: floor/wall/embedded", flush=True)
+    print(f"{'='*70}", flush=True)
+
+    # 保存初始3D资产摆放结果 (GLB #1)
+    save_final_glb(all_instances, args.output_path, "final_scene_initial.glb")
+
+    # 记录初始位姿
+    pose_history = _record_pose_stage(all_instances, refined_relations if 'refined_relations' in dir() else categories_and_relations, "initial")
 
     for category, category_instances in all_instances.items():
         relationship = categories_and_relations[category]
@@ -899,8 +1017,12 @@ def main(args):
                 continue
             category_instances[instance_id] = instance_info
 
-    # 保存基础精修后的结果 (Stage3产物, 供 run_post_pipeline.py 作为固定起点)
+    # 保存基础精修后的结果 (GLB #2, Stage3产物, 供 run_post_pipeline.py 作为固定起点)
     save_final_glb(all_instances, args.output_path, "final_scene.glb")
+
+    # 记录基础精修位姿变化
+    pose_history = _record_pose_stage(all_instances, categories_and_relations, "basic_refinement", pose_history)
+    _base_time = time.time() - _t_base
 
     import pickle
     pkl_path = os.path.join(args.output_path, "all_instances.pkl")
@@ -914,11 +1036,14 @@ def main(args):
     print(f"💾 all_instances.pkl 已保存: {pkl_path}", flush=True)
 
     # ── Stage 4: 迭代视觉-空间对齐 (可选，默认关闭) ──
+    _stage4_time = 0
     if args.enable_stage4:
+        _t4 = time.time()
         all_instances = run_stage4(
             args.output_path, vggt_prediction_results, all_instances, args,
             categories_and_relations=categories_and_relations,
             walls_info=walls_info,
+            deduplicated_all_masks=deduplicated_all_masks,
         )
         from tools.refine_inter_object_placement import resolve_penetrations
         all_instances = resolve_penetrations(all_instances, categories_and_relations, verbose=True, dry_run=True)
@@ -928,12 +1053,15 @@ def main(args):
         with open(s4_pkl_path, 'wb') as f:
             _pkl.dump(all_instances, f)
         print(f"💾 all_instances_stage4.pkl 已保存", flush=True)
+        _stage4_time = time.time() - _t4
     else:
         print("\n⏭️  Stage 4 已跳过 (使用 --enable_stage4 启用)", flush=True)
 
     # ── Stage 5: 高级语义精修 (可选，默认关闭) ──
+    _stage5_time = 0
     refined_relations = dict(categories_and_relations)
     if args.enable_stage5:
+        _t5 = time.time()
         all_instances, refined_relations = run_stage5(
             args.output_path, categories_and_relations, all_instances,
             vggt_prediction_results, all_optimal_frame_ids,
@@ -946,32 +1074,86 @@ def main(args):
             save_final_glb(all_instances, args.output_path, "final_scene_stage4_5.glb")
         else:
             save_final_glb(all_instances, args.output_path, "final_scene_stage5.glb")
+        # 记录Stage5位姿变化
+        pose_history = _record_pose_stage(all_instances, refined_relations, "stage5", pose_history)
+        _stage5_time = time.time() - _t5
+
+        # Stage5 内置物理仿真验证 (可选, 实验性功能)
+        if args.enable_physics_validation:
+            print("\n  ── Stage 5.3 物理仿真验证 (SAPIEN) ──", flush=True)
+            print("  ⚠️ 物理仿真是实验性功能，可能产生不合理结果", flush=True)
+            from tools.physics_validator import PhysicsValidator
+            validator = PhysicsValidator(
+                sim_steps=args.physics_sim_steps,
+                verbose=True,
+            )
+            all_instances_before = {cat: [dict(inst) for inst in insts] for cat, insts in all_instances.items()}
+            all_instances, physics_report = validator.validate(
+                all_instances,
+                categories_and_relations=categories_and_relations,
+                walls_info=walls_info,
+                output_dir=os.path.join(args.output_path, "physics_val"),
+            )
+            # 位移保护: 如果物理仿真位移超过1m，拒绝该结果，恢复精修后位姿
+            max_displacement = 1.0
+            for cat in all_instances:
+                for i, (inst_after, inst_before) in enumerate(zip(all_instances[cat], all_instances_before[cat])):
+                    pos_after = inst_after["T"][:3, 3]
+                    pos_before = inst_before["T"][:3, 3]
+                    disp = np.linalg.norm(pos_after - pos_before)
+                    if disp > max_displacement:
+                        print(f"  🚫 {cat}_{i}: 位移={disp:.3f}m > {max_displacement}m, 拒绝物理仿真结果", flush=True)
+                        all_instances[cat][i] = inst_before
+            pose_history = _record_pose_stage(all_instances, refined_relations, "physics", pose_history)
+
+            import json as _json
+            report_path = os.path.join(args.output_path, "physics_report.json")
+            with open(report_path, 'w') as f:
+                _json.dump(physics_report, f, indent=2, ensure_ascii=False)
+            print(f"  💾 物理验证报告: {report_path}", flush=True)
     else:
         print("\n⏭️  Stage 5 高级精修已跳过 (使用 --enable_stage5 启用)", flush=True)
+
+        # Stage5未启用时，物理验证仍可单独调用 (实验性功能)
+        if args.enable_physics_validation:
+            print("\n" + "=" * 70, flush=True)
+            print("🔬 物理仿真验证 (SAPIEN, 独立模式)", flush=True)
+            print("  ⚠️ 物理仿真是实验性功能，可能产生不合理结果", flush=True)
+            print("=" * 70, flush=True)
+            from tools.physics_validator import PhysicsValidator
+            validator = PhysicsValidator(
+                sim_steps=args.physics_sim_steps,
+                verbose=True,
+            )
+            all_instances_before = {cat: [dict(inst) for inst in insts] for cat, insts in all_instances.items()}
+            all_instances, physics_report = validator.validate(
+                all_instances,
+                categories_and_relations=categories_and_relations,
+                walls_info=walls_info,
+                output_dir=os.path.join(args.output_path, "physics_val"),
+            )
+            max_displacement = 1.0
+            for cat in all_instances:
+                for i, (inst_after, inst_before) in enumerate(zip(all_instances[cat], all_instances_before[cat])):
+                    pos_after = inst_after["T"][:3, 3]
+                    pos_before = inst_before["T"][:3, 3]
+                    disp = np.linalg.norm(pos_after - pos_before)
+                    if disp > max_displacement:
+                        print(f"  🚫 {cat}_{i}: 位移={disp:.3f}m > {max_displacement}m, 拒绝物理仿真结果", flush=True)
+                        all_instances[cat][i] = inst_before
+            pose_history = _record_pose_stage(all_instances, refined_relations, "physics", pose_history)
+
+            import json as _json
+            report_path = os.path.join(args.output_path, "physics_report.json")
+            with open(report_path, 'w') as f:
+                _json.dump(physics_report, f, indent=2, ensure_ascii=False)
+            print(f"💾 物理验证报告: {report_path}", flush=True)
 
     # 保存最终关系JSON
     with open(os.path.join(args.output_path, "final_relations.json"), 'w') as f:
         json.dump(refined_relations, f, indent=2, ensure_ascii=False)
 
-    # 保存位姿变化JSON (每个物体从Stage3到最终的位置历史)
-    pose_history = {}
-    for category, category_instances in all_instances.items():
-        for inst_idx, info in enumerate(category_instances):
-            key = f"{category}_{inst_idx}"
-            T = info["T"]
-            mesh = info["original_mesh"]
-            transformed = mesh.copy()
-            transformed.apply_transform(T)
-            pose_history[key] = {
-                "category": category,
-                "instance_idx": inst_idx,
-                "relation": refined_relations.get(category, "unknown"),
-                "T_matrix": T.tolist(),
-                "position": T[:3, 3].tolist(),
-                "bounds_min": transformed.bounds[0].tolist(),
-                "bounds_max": transformed.bounds[1].tolist(),
-                "center": transformed.bounds.mean(axis=0).tolist(),
-            }
+    # 保存位姿变化JSON (每个物体在各阶段的位置历史)
     pose_path = os.path.join(args.output_path, "pose_changes.json")
     with open(pose_path, 'w') as f:
         json.dump(pose_history, f, indent=2, ensure_ascii=False)
@@ -984,6 +1166,8 @@ def main(args):
         glb_path = os.path.join(args.output_path, "final_scene_stage4.glb")
     elif args.enable_stage5:
         glb_path = os.path.join(args.output_path, "final_scene_stage5.glb")
+    elif args.enable_physics_validation:
+        glb_path = os.path.join(args.output_path, "final_scene_physics.glb")
     else:
         glb_path = os.path.join(args.output_path, "final_scene.glb")
 
@@ -993,6 +1177,29 @@ def main(args):
     print(f"📂 输出目录: {args.output_path}", flush=True)
     print(f"📦 最终GLB: {glb_path}", flush=True)
     print("=" * 70, flush=True)
+
+    # ── 各阶段耗时汇总 ──
+    _stage_times = [
+        ("Stage 1 (物体发现)", _stage1_time),
+        ("Stage 2 (3D重建+去重)", _stage2_time),
+        ("Stage 3 (资产生成)", _stage3_time),
+        ("基础精修 (floor/wall)", _base_time),
+    ]
+    if _stage4_time > 0:
+        _stage_times.append(("Stage 4 (视觉-空间对齐)", _stage4_time))
+    if _stage5_time > 0:
+        _stage_times.append(("Stage 5 (语义精修)", _stage5_time))
+
+    _other_time = total_time - sum(t for _, t in _stage_times)
+    _stage_times.append(("其他 (IO/初始化等)", max(0, _other_time)))
+
+    print(f"\n⏱️ 各阶段耗时:", flush=True)
+    _sorted = sorted(_stage_times, key=lambda x: x[1], reverse=True)
+    for name, t in _sorted:
+        pct = t / total_time * 100 if total_time > 0 else 0
+        bar = "█" * int(pct / 2)
+        print(f"   {name:30s} {t:7.1f}s ({pct:5.1f}%) {bar}", flush=True)
+    print(f"   {'总计':30s} {total_time:7.1f}s", flush=True)
     print(f"📝 运行日志已保存到: {log_filename}")
 
 
@@ -1029,6 +1236,10 @@ if __name__ == "__main__":
                         help="Stage4 时序邻域半径 (默认5)")
     parser.add_argument("--stage4_use_mast3r", action="store_true",
                         help="Stage4 使用MASt3R匹配 (需要GPU)")
+    parser.add_argument("--enable_physics_validation", action="store_true",
+                        help="启用z轴合理性验证 (Stage5.3 或独立模式, 默认不启用)")
+    parser.add_argument("--physics_sim_steps", type=int, default=300,
+                        help="物理仿真检测步数 (默认300)")
 
     args = parser.parse_args()
 

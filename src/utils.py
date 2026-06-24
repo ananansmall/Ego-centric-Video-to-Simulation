@@ -48,13 +48,15 @@ def get_glasbey_colors(n):
         bgr_colors.append((b, g, r))
     return bgr_colors
 
-def vis_instance_masks(video_frames, all_masks, output_path):
+def vis_instance_masks(video_frames, all_masks, output_path, wall_masks=None, floor_masks=None):
     '''
         Visualize segmentation results in a video
         Args:
             video_frames: numpy array of shape (S, H, W, 3)
             all_masks: A dict returned by cross_category_deduplicate function
             output_path: path to save the video
+            wall_masks: list of dicts with 'frame_id' and 'mask' for wall segmentation
+            floor_masks: list of dicts with 'frame_id' and 'mask' for floor segmentation
     '''
     # to bgr format
     frames_to_show = video_frames[:,:,:,::-1].copy()
@@ -67,12 +69,17 @@ def vis_instance_masks(video_frames, all_masks, output_path):
 
     # color each instance in the video frames
     color_idx = 0
+    num_frames = len(frames_to_show)
     for category, category_masks in all_masks.items():
         for instance_id, instance_masks in enumerate(category_masks):
             color = colors[color_idx]
             for instance_mask in instance_masks:
                 frame_id = instance_mask['frame_id']
                 mask = instance_mask['mask']
+
+                # 越界保护: frame_id 可能超出视频帧范围
+                if frame_id < 0 or frame_id >= num_frames:
+                    continue
 
                 # add color to the mask
                 overlay = frames_to_show[frame_id].copy()
@@ -93,6 +100,36 @@ def vis_instance_masks(video_frames, all_masks, output_path):
                     cv2.putText(frames_to_show[frame_id], label, text_pos, 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
             color_idx += 1
+
+    # add wall masks (blue tint) and floor masks (green tint)
+    wall_color = np.array([255, 100, 0])
+    floor_color = np.array([0, 200, 200])
+    if wall_masks:
+        for wm in wall_masks:
+            fid = wm['frame_id']
+            mask = wm['mask']
+            if fid < len(frames_to_show):
+                overlay = frames_to_show[fid].copy()
+                overlay[mask] = wall_color
+                frames_to_show[fid] = cv2.addWeighted(overlay, 0.3, frames_to_show[fid], 0.7, 0)
+                coords = cv2.findNonZero(mask.astype(np.uint8))
+                if coords is not None:
+                    x, y, w, h = cv2.boundingRect(coords)
+                    cv2.putText(frames_to_show[fid], "wall", (x, y - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 100, 0), 2)
+    if floor_masks:
+        for fm in floor_masks:
+            fid = fm['frame_id']
+            mask = fm['mask']
+            if fid < len(frames_to_show):
+                overlay = frames_to_show[fid].copy()
+                overlay[mask] = floor_color
+                frames_to_show[fid] = cv2.addWeighted(overlay, 0.3, frames_to_show[fid], 0.7, 0)
+                coords = cv2.findNonZero(mask.astype(np.uint8))
+                if coords is not None:
+                    x, y, w, h = cv2.boundingRect(coords)
+                    cv2.putText(frames_to_show[fid], "floor", (x, y - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 200), 2)
 
     # save the output video
     with tempfile.TemporaryDirectory() as temp_dir:

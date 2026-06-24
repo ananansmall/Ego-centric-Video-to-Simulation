@@ -225,7 +225,7 @@ def vggt_omega_predict(images, model):
     )
     predictions_np["world_points_from_depth"] = world_points
 
-    point_cloud_data = _predictions_to_pcd(predictions_np, conf_thres=50.0)
+    point_cloud_data = _predictions_to_pcd(predictions_np, conf_thres=35.0)
 
     colors = (predictions_np['images'].transpose(0, 2, 3, 1) * 255).astype(np.uint8)
     depths = predictions_np['depth'].squeeze(-1)

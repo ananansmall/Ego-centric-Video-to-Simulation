@@ -57,7 +57,7 @@ def get_overlap_ratio(source_pts, target_pts):
     overlap_count = np.sum(dists < threshold)
     return overlap_count / len(source_pcd.points)
 
-def self_category_deduplicate(category_masks, world_points, world_points_conf, conf_k=50, overlap_thre=0.3):
+def self_category_deduplicate(category_masks, world_points, world_points_conf, conf_k=30, overlap_thre=0.3, category_name=""):
     '''
     Deduplication inside a single category
     Args:
@@ -66,12 +66,13 @@ def self_category_deduplicate(category_masks, world_points, world_points_conf, c
         world_points_conf: numpy array of shape (S, H, W)
         conf_k: Only keep top conf_k percent confidence 3D points
         overlap_thre: Merge instance if overlap ratio exceeds overlap_thre
+        category_name: Category name for logging
     Returns:
         deduplicated_category_masks: A list of deduplicated instance masks
     '''
     if not category_masks:
         return []
-    print(f"Starting self-deduplication for category with {len(category_masks)} raw instances...")
+    print(f"  [类内去重] {category_name}: {len(category_masks)} 个原始实例, overlap_thre={overlap_thre}")
 
     # back-project instance masks into pointcloud 
     instance_point_arrays = [] 
@@ -128,7 +129,10 @@ def self_category_deduplicate(category_masks, world_points, world_points_conf, c
     # Union-Find Clustering
     uf = UnionFind(range(len(instance_point_arrays)))
     n = len(instance_point_arrays)
+
+    instance_centroids = [np.mean(pts, axis=0) for pts in instance_point_arrays]
     
+    merge_details = []
     for i in range(n):
         for j in range(i + 1, n):
             if uf.find(i) == uf.find(j):
@@ -136,9 +140,15 @@ def self_category_deduplicate(category_masks, world_points, world_points_conf, c
             
             ov1 = get_overlap_ratio(instance_point_arrays[i], instance_point_arrays[j])
             ov2 = get_overlap_ratio(instance_point_arrays[j], instance_point_arrays[i])
-            
+
             if ov1 >= overlap_thre or ov2 >= overlap_thre:
                 uf.union(i, j)
+                reason = []
+                if ov1 >= overlap_thre:
+                    reason.append(f"ov1={ov1:.3f}>={overlap_thre}")
+                if ov2 >= overlap_thre:
+                    reason.append(f"ov2={ov2:.3f}>={overlap_thre}")
+                merge_details.append(f"    inst_{valid_indices[i]} + inst_{valid_indices[j]} ← {', '.join(reason)}")
                 
     groups = {}
     for i in range(n):
@@ -169,10 +179,13 @@ def self_category_deduplicate(category_masks, world_points, world_points_conf, c
             
         deduplicated_category_masks.append(merged_instance_list)
 
-    print(f"  -> Reduced {len(category_masks)} instances to {len(deduplicated_category_masks)} instances.")
+    print(f"  -> {category_name}: {len(category_masks)} instances → {len(deduplicated_category_masks)} instances (类内去重)")
+    if merge_details:
+        for d in merge_details:
+            print(d)
     return deduplicated_category_masks
 
-def cross_category_deduplicate(all_masks, world_points, world_points_conf, conf_k=50, overlap_thre=0.5, protected_categories=None):
+def cross_category_deduplicate(all_masks, world_points, world_points_conf, conf_k=30, overlap_thre=0.3):
     '''
     Deduplication across all categories
     Args:
@@ -181,15 +194,11 @@ def cross_category_deduplicate(all_masks, world_points, world_points_conf, conf_
         world_points: numpy array of shape (S, H, W, 3)
         world_points_conf: numpy array of shape (S, H, W)
         conf_k: Only keep top conf_k percent confidence 3D points
-        overlap_thre: Merge instance if overlap ratio exceeds overlap_thre
-        protected_categories: set of category names that should NOT be merged with each other.
-                              If two instances belong to different protected categories, they won't be merged.
+        overlap_thre: Merge instance if overlap ratio exceeds overlap_thre (same as self-category)
     Returns:
         deduplicated_all_masks: A dict (same format as input) containing deduplicated instances
     '''
     print(f"Starting cross-category deduplication...")
-    if protected_categories:
-        print(f"  Protected categories (won't cross-merge): {protected_categories}")
     
     all_candidates = []
     
@@ -243,27 +252,50 @@ def cross_category_deduplicate(all_masks, world_points, world_points_conf, conf_
 
     N = len(all_candidates)
     overlap_matrix = {} 
-    print(f"  Comparing {N} instances globally...")
+    print(f"  [跨类去重] Comparing {N} instances globally, overlap_thre={overlap_thre}...")
     uf = UnionFind(range(N))
-    
+
+    cross_merge_details = []
     for i in range(N):
         for j in range(i + 1, N):
-            # 始终计算并存储重叠率，因为后续平均重叠率计算需要访问所有配对
             pts_i = all_candidates[i]["points"]
             pts_j = all_candidates[j]["points"]
             
             ov1 = get_overlap_ratio(pts_i, pts_j) 
             ov2 = get_overlap_ratio(pts_j, pts_i)
             overlap_matrix[(i, j)] = (ov1, ov2)
-            
-            # 仅在实例尚未在同一组时才执行合并
+
             if uf.find(i) != uf.find(j):
-                if ov1 >= overlap_thre or ov2 >= overlap_thre:
-                    cat_i = all_candidates[i]["category"]
-                    cat_j = all_candidates[j]["category"]
-                    if protected_categories and cat_i in protected_categories and cat_j in protected_categories and cat_i != cat_j:
-                        continue
+                should_merge = ov1 >= overlap_thre or ov2 >= overlap_thre
+
+                # 跨类去重保护: 不同类别的物体，如果面积差异大，不应合并
+                # 场景: 小物体(eye/scissor)放在大物体(table)上，3D空间重叠度高
+                # 但它们是不同物体，不应被吞并
+                cat_i = all_candidates[i]["category"]
+                cat_j = all_candidates[j]["category"]
+                if should_merge and cat_i != cat_j:
+                    pts_i_count = len(all_candidates[i]["points"])
+                    pts_j_count = len(all_candidates[j]["points"])
+                    size_ratio = min(pts_i_count, pts_j_count) / max(pts_i_count, pts_j_count)
+                    # 如果小物体点数不到大物体的 40%，且只有单方向 overlap 高，
+                    # 说明是小物体放在大物体上，不应合并
+                    if size_ratio < 0.4:
+                        # 只有双向 overlap 都高才合并 (说明确实是同一个物体)
+                        should_merge = ov1 >= overlap_thre and ov2 >= overlap_thre
+                        if not should_merge and (ov1 >= overlap_thre or ov2 >= overlap_thre):
+                            cross_merge_details.append(
+                                f"    🛡️ {cat_i}_{i} + {cat_j}_{j} 跨类保护: "
+                                f"size_ratio={size_ratio:.2f}, ov1={ov1:.3f}, ov2={ov2:.3f} → 不合并"
+                            )
+
+                if should_merge:
                     uf.union(i, j)
+                    reason = []
+                    if ov1 >= overlap_thre:
+                        reason.append(f"ov1={ov1:.3f}>={overlap_thre}")
+                    if ov2 >= overlap_thre:
+                        reason.append(f"ov2={ov2:.3f}>={overlap_thre}")
+                    cross_merge_details.append(f"    {cat_i}_{i} + {cat_j}_{j} ← {', '.join(reason)}")
     final_groups = {}
     for i in range(N):
         root = uf.find(i)
@@ -335,5 +367,134 @@ def cross_category_deduplicate(all_masks, world_points, world_points_conf, conf_
         deduplicated_all_masks[cat].append(obj["original_masks"])
 
     filtered_object_count = sum(len(instances) for instances in deduplicated_all_masks.values())
-    print(f"  -> Reduced total instances to {filtered_object_count} global objects.")
+    print(f"  -> 跨类去重: {sum(len(v) for v in all_masks.values())} instances → {filtered_object_count} instances")
+    if cross_merge_details:
+        for d in cross_merge_details:
+            print(d)
     return deduplicated_all_masks
+
+
+def _bbox_iou_3d(bbox_a, bbox_b):
+    """
+    Compute 3D bounding box IoU.
+    Args:
+        bbox_a: (2, 3) array, [min_corner, max_corner]
+        bbox_b: (2, 3) array, [min_corner, max_corner]
+    Returns:
+        IoU value in [0, 1]
+    """
+    min_a, max_a = bbox_a
+    min_b, max_b = bbox_b
+    inter_min = np.maximum(min_a, min_b)
+    inter_max = np.minimum(max_a, max_b)
+    inter_size = np.maximum(inter_max - inter_min, 0.0)
+    inter_vol = np.prod(inter_size)
+    vol_a = np.prod(max_a - min_a)
+    vol_b = np.prod(max_b - min_b)
+    union_vol = vol_a + vol_b - inter_vol
+    if union_vol <= 0:
+        return 0.0
+    return inter_vol / union_vol
+
+
+def deduplicate_3d_assets(all_instances, all_masks=None, iou_thre=0.3):
+    """
+    Post-generation 3D mesh deduplication.
+    Compares meshes in world space (after applying T) to find and remove duplicates.
+
+    Args:
+        all_instances: dict {category: list[dict{"original_mesh": trimesh, "T": (4,4)}]}
+        all_masks: dict {category: list[list[dict{frame_id, mask}]]}, synced with all_instances
+        iou_thre: Bounding box IoU threshold for considering two meshes as duplicates
+    Returns:
+        deduplicated_instances: dict (same format), with duplicates removed
+        deduplicated_masks: dict (same format as all_masks), synced with deduplicated_instances
+        removed_info: list of (category, index, reason) for logging
+    """
+    print(f"\n🔍 3D Mesh 去重 (post-generation deduplication)...")
+    flat_list = []
+    for cat, inst_list in all_instances.items():
+        for idx, inst in enumerate(inst_list):
+            mesh = inst["original_mesh"]
+            T = inst["T"]
+            transformed = mesh.copy()
+            transformed.apply_transform(T)
+            centroid = transformed.centroid
+            bbox = transformed.bounds
+            flat_list.append({
+                "category": cat,
+                "index": idx,
+                "centroid": centroid,
+                "bbox": bbox,
+                "volume": transformed.volume if transformed.is_watertight else abs(transformed.volume),
+                "vertex_count": len(transformed.vertices),
+            })
+
+    n = len(flat_list)
+    if n <= 1:
+        print(f"  Only {n} instance, no deduplication needed.")
+        return all_instances, all_masks, []
+
+    uf = UnionFind(range(n))
+    mesh_merge_details = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            if uf.find(i) == uf.find(j):
+                continue
+            iou = _bbox_iou_3d(flat_list[i]["bbox"], flat_list[j]["bbox"])
+            if iou >= iou_thre:
+                uf.union(i, j)
+                mesh_merge_details.append(
+                    f"    {flat_list[i]['category']}_{flat_list[i]['index']} + "
+                    f"{flat_list[j]['category']}_{flat_list[j]['index']} ← bbox_iou={iou:.3f}>={iou_thre}"
+                )
+
+    groups = {}
+    for i in range(n):
+        root = uf.find(i)
+        if root not in groups:
+            groups[root] = []
+        groups[root].append(i)
+
+    keep_indices = set()
+    removed_info = []
+    for group_indices in groups.values():
+        if len(group_indices) == 1:
+            keep_indices.add(group_indices[0])
+            continue
+        best_idx = max(group_indices, key=lambda i: flat_list[i]["vertex_count"])
+        keep_indices.add(best_idx)
+        for idx in group_indices:
+            if idx != best_idx:
+                info = flat_list[idx]
+                best_info = flat_list[best_idx]
+                removed_info.append((
+                    info["category"], info["index"],
+                    f"duplicate of {best_info['category']}_{best_info['index']} "
+                    f"(centroid_dist={np.linalg.norm(info['centroid'] - best_info['centroid']):.4f}m)"
+                ))
+
+    deduplicated_instances = {}
+    deduplicated_masks = {}
+    for i in sorted(keep_indices):
+        cat = flat_list[i]["category"]
+        orig_idx = flat_list[i]["index"]
+        if cat not in deduplicated_instances:
+            deduplicated_instances[cat] = []
+            if all_masks is not None:
+                deduplicated_masks[cat] = []
+        deduplicated_instances[cat].append(all_instances[cat][orig_idx])
+        if all_masks is not None and cat in all_masks:
+            deduplicated_masks[cat].append(all_masks[cat][orig_idx])
+
+    total_before = sum(len(v) for v in all_instances.values())
+    total_after = sum(len(v) for v in deduplicated_instances.values())
+    if removed_info:
+        print(f"  ⚠️  Removed {len(removed_info)} duplicate 3D assets:")
+        for cat, idx, reason in removed_info:
+            print(f"      {cat}_{idx}: {reason}")
+    if mesh_merge_details:
+        for d in mesh_merge_details:
+            print(d)
+    print(f"  -> {total_before} instances → {total_after} instances (3D Mesh去重)")
+    return deduplicated_instances, deduplicated_masks, removed_info

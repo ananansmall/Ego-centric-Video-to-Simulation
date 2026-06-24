@@ -276,6 +276,401 @@ def align_to_room_coordinate_system(world_points, wall_masks, floor_masks, wall_
     t[:2] = -center[:2]
     return R, t
 
+
+def _orient_floor_normal(floor_normal, floor_centroid, all_points):
+    """
+    确保 floor_normal 朝上 (朝向场景上方).
+    用点云整体质心判断: floor 在底部, 场景质心在 floor 上方.
+    """
+    all_centroid = np.mean(all_points, axis=0)
+    if np.dot(all_centroid - floor_centroid, floor_normal) < 0:
+        return -floor_normal
+    return floor_normal
+
+
+def _build_R_t_from_floor(world_points, floor_normal, floor_centroid, wall_normal_1=None):
+    """
+    给定 floor 平面法线和质心, 构造 R, t.
+    如果提供 wall_normal_1, 用它确定水平方向; 否则用点云 PCA.
+    """
+    floor_normal = floor_normal / np.linalg.norm(floor_normal)
+
+    if wall_normal_1 is not None:
+        wall_normal_1 = wall_normal_1 / np.linalg.norm(wall_normal_1)
+        wall_normal_1 = wall_normal_1 - np.dot(wall_normal_1, floor_normal) * floor_normal
+        wall_normal_1 = wall_normal_1 / np.linalg.norm(wall_normal_1)
+    else:
+        all_points_flat = world_points.reshape(-1, 3)
+        centered = all_points_flat - np.mean(all_points_flat, axis=0)
+        cov = np.dot(centered.T, centered)
+        eigenvalues, eigenvectors = np.linalg.eigh(cov)
+        wall_normal_1 = eigenvectors[:, -1]
+        wall_normal_1 = wall_normal_1 - np.dot(wall_normal_1, floor_normal) * floor_normal
+        wall_normal_1 = wall_normal_1 / np.linalg.norm(wall_normal_1)
+
+    wall_normal_2 = np.cross(floor_normal, wall_normal_1)
+    wall_normal_2 = wall_normal_2 / np.linalg.norm(wall_normal_2)
+    wall_normal_1 = np.cross(wall_normal_2, floor_normal)
+    wall_normal_1 = wall_normal_1 / np.linalg.norm(wall_normal_1)
+
+    R = np.stack([wall_normal_1, wall_normal_2, floor_normal], axis=0)
+
+    rotated_floor_centroid = floor_centroid @ R.T
+    t = np.zeros(3)
+    t[2] = -rotated_floor_centroid[2]
+    all_points = world_points.reshape(-1, 3)
+    rotated_points = all_points @ R.T
+    min_coords = np.min(rotated_points, axis=0)
+    max_coords = np.max(rotated_points, axis=0)
+    center = (min_coords + max_coords) / 2
+    t[:2] = -center[:2]
+
+    return R, t
+
+
+def align_via_objects(world_points, wall_masks, floor_masks,
+                      wall_mean_distance_thres=0.05,
+                      floor_mean_distance_thres=0.05,
+                      orthogonal_threshold_deg=80):
+    '''
+    阶段2: 放宽阈值 + 只用floor平面建立坐标系.
+
+    与 align_to_room_coordinate_system 的区别:
+      1. 放宽 mean_distance 阈值 (0.02 → 0.05)
+      2. 放宽正交条件 (85° → 80°)
+      3. 如果没有正交wall, 只用floor平面 + 点云PCA确定水平方向
+
+    Returns:
+      (R, t, info_dict): 成功
+      (np.eye(3), np.zeros(3), info_dict): 失败
+    '''
+    wall_plane_infos = []
+    floor_plane_infos = []
+    for wall_mask in wall_masks:
+        frame_id = wall_mask['frame_id']
+        mask = wall_mask['mask']
+        pointmap = world_points[frame_id]
+        plane_info = get_plane_info(pointmap, mask)
+        if plane_info['mean_distance'] < wall_mean_distance_thres:
+            wall_plane_infos.append(plane_info)
+    for floor_mask in floor_masks:
+        frame_id = floor_mask['frame_id']
+        mask = floor_mask['mask']
+        pointmap = world_points[frame_id]
+        plane_info = get_plane_info(pointmap, mask)
+        if plane_info['mean_distance'] < floor_mean_distance_thres:
+            floor_plane_infos.append(plane_info)
+
+    if len(floor_plane_infos) == 0:
+        return np.eye(3), np.zeros(3), {'reason': 'no_valid_floor', 'n_floor': len(floor_masks), 'n_wall': len(wall_masks)}
+
+    mean_floor_normal = np.mean([info['normal'] for info in floor_plane_infos], axis=0)
+    mean_floor_normal = mean_floor_normal / np.linalg.norm(mean_floor_normal)
+    valid_floor_plane_infos = [info for info in floor_plane_infos
+                               if abs(np.dot(info['normal'], mean_floor_normal)) > np.cos(np.radians(30))]
+    if len(valid_floor_plane_infos) == 0:
+        return np.eye(3), np.zeros(3), {'reason': 'no_consistent_floor', 'n_floor': len(floor_masks)}
+    floor_plane_info = max(valid_floor_plane_infos, key=lambda x: x['area'])
+    floor_normal = floor_plane_info['normal']
+    floor_centroid = floor_plane_info['centroid']
+
+    all_points = world_points.reshape(-1, 3)
+    floor_normal = _orient_floor_normal(floor_normal, floor_centroid, all_points)
+
+    orthogonal_wall_plane_infos = [info for info in wall_plane_infos
+                                   if abs(np.dot(info['normal'], floor_normal)) < np.cos(np.radians(orthogonal_threshold_deg))]
+
+    if len(orthogonal_wall_plane_infos) > 0:
+        wall_plane_info = max(orthogonal_wall_plane_infos, key=lambda x: x['area'])
+        wall_normal_1 = wall_plane_info['normal']
+        method = 'floor+wall'
+    else:
+        wall_normal_1 = None
+        method = 'floor+pca'
+
+    R, t = _build_R_t_from_floor(world_points, floor_normal, floor_centroid, wall_normal_1)
+
+    return R, t, {
+        'method': method,
+        'floor_area': float(floor_plane_info['area']),
+        'floor_mean_distance': float(floor_plane_info['mean_distance']),
+        'n_floor_valid': len(floor_plane_infos),
+        'n_wall_orthogonal': len(orthogonal_wall_plane_infos),
+    }
+
+
+def align_via_large_plane(world_points, large_plane_masks, floor_mean_distance_thres=0.05):
+    '''
+    阶段3: 用SAM3大平面mask拟合floor平面.
+
+    从所有大平面mask中, 选最大面积的平面作为 floor.
+    用点云 PCA 确定水平方向.
+
+    Args:
+      world_points: (T, H, W, 3)
+      large_plane_masks: list of dicts with 'frame_id' and 'mask'
+
+    Returns:
+      (R, t, info_dict): 成功
+      (np.eye(3), np.zeros(3), info_dict): 失败
+    '''
+    if len(large_plane_masks) == 0:
+        return np.eye(3), np.zeros(3), {'reason': 'no_large_plane', 'n_masks': 0}
+
+    plane_infos = []
+    for pm in large_plane_masks:
+        frame_id = pm['frame_id']
+        mask = pm['mask']
+        pointmap = world_points[frame_id]
+        info = get_plane_info(pointmap, mask)
+        if info['mean_distance'] < floor_mean_distance_thres and info['area'] > 0:
+            plane_infos.append(info)
+
+    if len(plane_infos) == 0:
+        return np.eye(3), np.zeros(3), {'reason': 'no_valid_plane', 'n_masks': len(large_plane_masks)}
+
+    floor_plane_info = max(plane_infos, key=lambda x: x['area'])
+    floor_normal = floor_plane_info['normal']
+    floor_centroid = floor_plane_info['centroid']
+
+    all_points = world_points.reshape(-1, 3)
+    floor_normal = _orient_floor_normal(floor_normal, floor_centroid, all_points)
+
+    R, t = _build_R_t_from_floor(world_points, floor_normal, floor_centroid, wall_normal_1=None)
+
+    return R, t, {
+        'method': 'large_plane+pca',
+        'floor_area': float(floor_plane_info['area']),
+        'floor_mean_distance': float(floor_plane_info['mean_distance']),
+        'n_planes': len(plane_infos),
+    }
+
+
+def align_via_vlm_floor_points(world_points, images, sam3_image_model,
+                               vlm_model, vlm_processor,
+                               num_sample_frames=4,
+                               floor_mean_distance_thres=0.05):
+    """
+    阶段2.5: VLM识别地面参考点 + SAM3 box prompt分割 + 平面拟合.
+
+    SAM3的Sam3Processor没有point prompt, 因此:
+      1. 用VLM从采样帧中识别地面代表性点 (归一化坐标)
+      2. 围绕每个点构造小box, 调用SAM3 add_geometric_prompt生成mask
+      3. 用mask拟合floor平面, 建立坐标系
+
+    Args:
+        world_points: (T, H, W, 3)
+        images: (T, H, W, 3) uint8 RGB
+        sam3_image_model: SAM3 image processor (已加载)
+        vlm_model: VLM模型 (已加载)
+        vlm_processor: VLM processor (已加载)
+        num_sample_frames: 采样多少帧进行VLM检测 (默认4)
+        floor_mean_distance_thres: 平面拟合mean_distance阈值
+
+    Returns:
+        (R, t, info_dict): 成功或失败
+    """
+    from src.object_segmentation import (
+        detect_floor_reference_points_with_vlm,
+        segment_floor_with_box_prompts,
+    )
+
+    T = images.shape[0]
+    if num_sample_frames is not None and T > num_sample_frames:
+        indices = np.round(np.linspace(0, T - 1, num_sample_frames)).astype(int)
+    else:
+        indices = np.arange(T)
+
+    reference_points_per_frame = {}
+    for idx in indices:
+        points = detect_floor_reference_points_with_vlm(
+            images[idx], vlm_model, vlm_processor, num_points=4
+        )
+        if points:
+            reference_points_per_frame[int(idx)] = points
+
+    if len(reference_points_per_frame) == 0:
+        return np.eye(3), np.zeros(3), {
+            'reason': 'vlm_no_floor_points',
+            'n_sampled_frames': len(indices),
+        }
+
+    floor_masks = segment_floor_with_box_prompts(
+        images, sam3_image_model, reference_points_per_frame, box_size=0.05
+    )
+
+    if len(floor_masks) == 0:
+        return np.eye(3), np.zeros(3), {
+            'reason': 'sam3_no_floor_masks',
+            'n_vlm_points': sum(len(v) for v in reference_points_per_frame.values()),
+        }
+
+    # 用现有 align_via_objects 的逻辑拟合平面 (去掉wall, 只用floor)
+    # 这里复用 get_plane_info + _build_R_t_from_floor
+    plane_infos = []
+    for fm in floor_masks:
+        frame_id = fm['frame_id']
+        mask = fm['mask']
+        pointmap = world_points[frame_id]
+        info = get_plane_info(pointmap, mask)
+        if info['mean_distance'] < floor_mean_distance_thres and info['area'] > 0:
+            plane_infos.append(info)
+
+    if len(plane_infos) == 0:
+        return np.eye(3), np.zeros(3), {
+            'reason': 'no_valid_floor_plane',
+            'n_sam3_masks': len(floor_masks),
+        }
+
+    # 选最大面积的floor平面
+    floor_plane_info = max(plane_infos, key=lambda x: x['area'])
+    floor_normal = floor_plane_info['normal']
+    floor_centroid = floor_plane_info['centroid']
+
+    all_points = world_points.reshape(-1, 3)
+    floor_normal = _orient_floor_normal(floor_normal, floor_centroid, all_points)
+
+    R, t = _build_R_t_from_floor(world_points, floor_normal, floor_centroid, wall_normal_1=None)
+
+    return R, t, {
+        'method': 'vlm_floor_points+sam3_box',
+        'floor_area': float(floor_plane_info['area']),
+        'floor_mean_distance': float(floor_plane_info['mean_distance']),
+        'n_vlm_frames': len(reference_points_per_frame),
+        'n_sam3_masks': len(floor_masks),
+        'n_valid_planes': len(plane_infos),
+    }
+
+
+def align_via_geocalib(images, world_points, max_frames=8, mad_threshold=3.0):
+    '''
+    阶段4: 用 GeoCalib 从图像估计重力方向, 构造坐标系对齐.
+
+    参考 do-as-i-do/reconstruction/scripts/predict_video_gravity.py 的逻辑:
+      1. 对每帧图像运行 GeoCalib → 得到 gravity 向量 (相机坐标系下的"上"方向)
+      2. 置信度加权的球面平均 + MAD 异常值剔除 → 最终 gravity 向量
+      3. gravity 向量就是相机坐标系中"上"的方向 → 旋转对齐到世界 z 轴
+
+    Args:
+      images: numpy array of shape (S, H, W, 3), uint8 RGB
+      world_points: (T, H, W, 3)
+      max_frames: 最多处理多少帧 (GeoCalib 推理较慢, 默认8帧)
+      mad_threshold: MAD 异常值剔除阈值 (默认3.0)
+
+    Returns:
+      (R, t, info_dict): 成功
+      (np.eye(3), np.zeros(3), info_dict): 失败
+    '''
+    try:
+        import torch
+        from geocalib import GeoCalib
+    except ImportError:
+        return np.eye(3), np.zeros(3), {'reason': 'geocalib_not_installed'}
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    try:
+        model = GeoCalib(weights="pinhole").to(device)
+        model.eval()
+    except Exception as e:
+        return np.eye(3), np.zeros(3), {'reason': f'geocalib_load_failed: {e}'}
+
+    S = images.shape[0]
+    if max_frames is not None and S > max_frames:
+        indices = np.round(np.linspace(0, S - 1, max_frames)).astype(int)
+    else:
+        indices = np.arange(S)
+
+    gravity_vecs = []
+    confidences = []
+    per_frame_info = []
+
+    with torch.no_grad():
+        for idx in indices:
+            img = images[idx]
+            # numpy (H,W,3) uint8 → torch (1,3,H,W) float [0,1]
+            img_tensor = torch.from_numpy(img).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+            img_tensor = img_tensor.to(device)
+            try:
+                results = model.calibrate(img_tensor, camera_model="pinhole")
+                grav = results["gravity"]
+                vec = grav.vec3d.squeeze(0).cpu()  # [3] 相机坐标系下的重力方向
+                up_conf = results["up_confidence"].mean().item()
+                lat_conf = results["latitude_confidence"].mean().item()
+                conf = (up_conf + lat_conf) / 2.0
+                gravity_vecs.append(vec)
+                confidences.append(conf)
+                per_frame_info.append({
+                    'frame_id': int(idx),
+                    'vec': vec.numpy().tolist(),
+                    'confidence': conf,
+                })
+            except Exception as e:
+                per_frame_info.append({
+                    'frame_id': int(idx),
+                    'error': str(e),
+                })
+
+    if len(gravity_vecs) == 0:
+        return np.eye(3), np.zeros(3), {
+            'reason': 'geocalib_no_frames',
+            'n_attempted': len(indices),
+            'per_frame': per_frame_info,
+        }
+
+    vecs = torch.stack(gravity_vecs)  # [N, 3]
+    confs = torch.tensor(confidences)  # [N]
+
+    # 球面平均 + MAD 异常值剔除
+    def spherical_mean(v, w=None):
+        if w is not None:
+            w = w / w.sum()
+            m = (v * w.unsqueeze(-1)).sum(dim=0)
+        else:
+            m = v.mean(dim=0)
+        return torch.nn.functional.normalize(m, dim=-1)
+
+    mean_vec = spherical_mean(vecs)
+    dots = (vecs * mean_vec.unsqueeze(0).expand_as(vecs)).sum(dim=-1).clamp(-1.0, 1.0)
+    angles = torch.acos(dots)
+    median_angle = angles.median()
+    mad = (angles - median_angle).abs().median().clamp(min=1e-6)
+    threshold = median_angle + mad_threshold * mad
+    inlier_mask = angles <= threshold
+    n_inliers = inlier_mask.sum().item()
+
+    if n_inliers == 0:
+        return np.eye(3), np.zeros(3), {
+            'reason': 'geocalib_all_outliers',
+            'n_frames': len(vecs),
+            'per_frame': per_frame_info,
+        }
+
+    inlier_vecs = vecs[inlier_mask]
+    inlier_confs = confs[inlier_mask]
+    final_vec = spherical_mean(inlier_vecs, w=inlier_confs)
+
+    # final_vec 是相机坐标系下的"上"方向 (gravity 向量)
+    # 我们需要构造 R, 使得 R @ final_vec ≈ [0, 0, 1] (世界 z 轴)
+    floor_normal = final_vec.numpy()  # [3]
+    floor_normal = floor_normal / np.linalg.norm(floor_normal)
+
+    # 用 _build_R_t_from_floor 构造 R, t
+    # floor_centroid 用点云质心近似
+    all_points = world_points.reshape(-1, 3)
+    floor_centroid = np.mean(all_points, axis=0)
+
+    R, t = _build_R_t_from_floor(world_points, floor_normal, floor_centroid, wall_normal_1=None)
+
+    return R, t, {
+        'method': 'geocalib',
+        'gravity_vec': final_vec.numpy().tolist(),
+        'n_frames': len(vecs),
+        'n_inliers': n_inliers,
+        'per_frame': per_frame_info,
+    }
+
+
 def align_vggt_predictions(predictions, R, t):
     '''
     Align the VGGt predictions to the room coordinate system using the given rotation and translation.
@@ -304,29 +699,21 @@ def align_vggt_predictions(predictions, R, t):
     predictions['point_cloud_data'].apply_transform(np.vstack([np.hstack([R, t.reshape(3, 1)]), [0, 0, 0, 1]]))
     return predictions
 
-def get_optimal_view_frame_id(world_points, instance_masks, motion_threshold=0.02):
+def get_optimal_view_frame_id(world_points, instance_masks, motion_threshold=0.10):
     '''
     Get the optimal view frame id for each instance.
-
-    策略:
-      - 所有物体: 用3D表面积最大的帧生成mesh (形状最完整)
-      - 动态物体: 位置摆在初始看见的位置 (首帧位置)
-      - 静态物体: 位置与生成帧一致 (无需额外调整)
-
-    动态/静态判断:
-      1. 逐帧中位数位移 (捕捉渐变漂移)
-      2. 全局位移: 首20%帧 vs 末20%帧质心距离 (捕捉VGGT漂移平滑后的真实运动)
-      任一信号超过阈值即判定为动态
-
+    Uses robust motion detection: computes per-frame centroid displacement,
+    then uses median displacement to distinguish true motion from VGGT drift.
+    
     Args:
         world_points: numpy array of shape (T, H, W, 3)
         instance_masks: list of dicts with 'frame_id' and 'mask'
         motion_threshold: median displacement threshold (meters) for dynamic classification
     Returns:
         (optimal_frame_id, is_dynamic, motion_info)
-        - optimal_frame_id: int (3D表面积最大的帧, 用于生成mesh)
+        - optimal_frame_id: int
         - is_dynamic: bool
-        - motion_info: dict with median_disp, max_disp, global_disp, first_valid_frame, num_valid_frames
+        - motion_info: dict with median_disp, max_disp, first_valid_frame, num_valid_frames
     '''
     centroids = []
     for instance_mask in instance_masks:
@@ -349,7 +736,7 @@ def get_optimal_view_frame_id(world_points, instance_masks, motion_threshold=0.0
 
     if num_valid_frames < 2:
         first_valid_frame = valid_centroids[0][0] if valid_centroids else instance_masks[0]['frame_id']
-        motion_info = {'median_disp': 0.0, 'max_disp': 0.0, 'global_disp': 0.0,
+        motion_info = {'median_disp': 0.0, 'max_disp': 0.0,
                        'first_valid_frame': first_valid_frame, 'num_valid_frames': num_valid_frames}
         return first_valid_frame, False, motion_info
 
@@ -362,27 +749,16 @@ def get_optimal_view_frame_id(world_points, instance_masks, motion_threshold=0.0
     max_disp = float(np.max(consecutive_disps))
     first_valid_frame = valid_centroids[0][0]
 
-    n_head = max(1, num_valid_frames // 5)
-    n_tail = max(1, num_valid_frames // 5)
-    head_centroids = valid_centroids[:n_head]
-    tail_centroids = valid_centroids[-n_tail:]
-    head_mean = np.mean([c for _, c in head_centroids], axis=0)
-    tail_mean = np.mean([c for _, c in tail_centroids], axis=0)
-    global_disp = float(np.linalg.norm(tail_mean - head_mean))
-
-    is_dynamic_consecutive = median_disp > motion_threshold
-    is_dynamic_global = global_disp > max(motion_threshold * 2, 0.04)
-    is_dynamic = is_dynamic_consecutive or is_dynamic_global
+    is_dynamic = median_disp > motion_threshold
 
     motion_info = {
         'median_disp': round(median_disp, 4),
         'max_disp': round(max_disp, 4),
-        'global_disp': round(global_disp, 4),
         'first_valid_frame': first_valid_frame,
         'num_valid_frames': num_valid_frames,
     }
 
-    # 所有物体: 选择3D表面积最大的帧 (用于生成mesh)
+    # 无论动态/静态, 都用最大面积帧生成 mesh (动态物体在 mainv2 中再调整位置/姿态到 first_valid_frame)
     optimal_frame_id = -1
     max_area = 0
     for instance_mask in instance_masks:

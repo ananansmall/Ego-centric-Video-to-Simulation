@@ -66,6 +66,7 @@ def refine_supported_by_floor_object(object_info):
         - T: the transformation matrix to align the mesh to the world coordinate system
     Returns: The same dict with a different "T" to align the object to the floor.
     '''
+    old_pos = object_info["T"][:3, 3].copy()
     transform_matrix = object_info["T"]
     upper_real_vector = np.array([0, 0, 1])
     # Note that glb is y-up, but ours format is z-up.
@@ -95,6 +96,9 @@ def refine_supported_by_floor_object(object_info):
     # align the bottom of the object to the floor
     transform_matrix = translation_matrix @ transform_matrix
     object_info["T"] = transform_matrix
+    new_pos = object_info["T"][:3, 3].copy()
+    print(f"      [floor] theta_gravity={theta_gravity:.1f}°, z_min={z_min:.4f}m, "
+          f"pos: ({old_pos[0]:.3f},{old_pos[1]:.3f},{old_pos[2]:.3f}) → ({new_pos[0]:.3f},{new_pos[1]:.3f},{new_pos[2]:.3f})", flush=True)
     return object_info
 
 
@@ -109,6 +113,7 @@ def refine_embedded_in_wall_object(object_info, walls_info):
             camera_pos: optional camera position, kept for interface consistency with attached-to-wall refinement.
     Returns: The same dict with refined "T".
     '''
+    old_pos = object_info["T"][:3, 3].copy()
     if not walls_info:
         return object_info
 
@@ -145,6 +150,8 @@ def refine_embedded_in_wall_object(object_info, walls_info):
         transform_matrix = trimesh.transformations.translation_matrix(np.array([0.0, 0.0, -z_min])) @ transform_matrix
 
     object_info["T"] = transform_matrix
+    new_pos = object_info["T"][:3, 3].copy()
+    print(f"      [embedded_wall] wall_axis={wall_axis}, pos: ({old_pos[0]:.3f},{old_pos[1]:.3f},{old_pos[2]:.3f}) → ({new_pos[0]:.3f},{new_pos[1]:.3f},{new_pos[2]:.3f})", flush=True)
     return object_info
 
 
@@ -159,6 +166,7 @@ def refine_attached_to_wall_object(object_info, walls_info, camera_pos=None):
             camera_pos: optional camera position used to determine which side of the object should touch the wall.
     Returns: The same dict with refined "T".
     '''
+    old_pos = object_info["T"][:3, 3].copy()
     if not walls_info:
         return object_info
 
@@ -212,4 +220,6 @@ def refine_attached_to_wall_object(object_info, walls_info, camera_pos=None):
         transform_matrix = trimesh.transformations.translation_matrix(np.array([0.0, 0.0, -z_min])) @ transform_matrix
 
     object_info["T"] = transform_matrix
+    new_pos = object_info["T"][:3, 3].copy()
+    print(f"      [attached_wall] wall_axis={wall_axis}, pos: ({old_pos[0]:.3f},{old_pos[1]:.3f},{old_pos[2]:.3f}) → ({new_pos[0]:.3f},{new_pos[1]:.3f},{new_pos[2]:.3f})", flush=True)
     return object_info
