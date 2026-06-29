@@ -81,6 +81,7 @@ def create_id_labeled_image(
     instance_masks: Dict[str, List[Dict]],
     categories_and_relations: Dict[str, str],
     display_id_offset: int = 3,
+    best_frame_id: int = None,
 ) -> np.ndarray:
     """
     在帧图像上为每个可见实例绘制ID标注 (绿色边框 + 红色编号)
@@ -90,6 +91,7 @@ def create_id_labeled_image(
         instance_masks: {category: [{frame_id, mask}, ...]} 每个实例的mask数据
         categories_and_relations: {category: relation} 物体关系
         display_id_offset: 显示ID偏移 (与SimRecon一致, floor=1, wall=2, 物体从3开始)
+        best_frame_id: 当前标注的帧ID, 用于从每个实例的mask列表中选取对应帧的mask
     返回:
         标注后的RGB图像
     """
@@ -109,10 +111,15 @@ def create_id_labeled_image(
         category_to_display_ids[category] = []
 
         for inst_idx, inst_mask_list in enumerate(cat_masks):
+            # 优先选 best_frame_id 对应的 mask; 找不到则回退到第一个
             mask_for_frame = None
-            for im in inst_mask_list:
-                mask_for_frame = im['mask']
-                break
+            if best_frame_id is not None:
+                for im in inst_mask_list:
+                    if im.get('frame_id') == best_frame_id:
+                        mask_for_frame = im['mask']
+                        break
+            if mask_for_frame is None and inst_mask_list:
+                mask_for_frame = inst_mask_list[0]['mask']
 
             if mask_for_frame is None:
                 category_to_display_ids[category].append(display_id)
@@ -498,7 +505,8 @@ def infer_relations_scene_graph(
     colors: List[np.ndarray] = None,
     id_scene_path: str = None,
     output_dir: str = None,
-) -> Dict[str, str]:
+    preloaded_vlm: tuple = None,
+) -> tuple:
     """
     使用 SimRecon 场景图推断方式获取物体间关系
 
@@ -510,8 +518,9 @@ def infer_relations_scene_graph(
         colors: 帧图像列表 (如果为None, 尝试从磁盘加载)
         id_scene_path: 已有的ID标注图路径 (如果为None, 自动创建)
         output_dir: 输出目录 (默认为scene_dir)
+        preloaded_vlm: 预加载的VLM (model, processor), 避免重复加载
     返回:
-        更新后的 categories_and_relations
+        (refined_relations, vlm_or_None): 更新后的关系字典 + VLM模型(供后续使用)
     """
     if output_dir is None:
         output_dir = scene_dir
@@ -532,13 +541,14 @@ def infer_relations_scene_graph(
 
         if instance_masks is None or colors is None:
             print("   ❌ 无法加载mask或图像数据，回退到逐物体推断", flush=True)
-            return dict(categories_and_relations)
+            return dict(categories_and_relations), None
 
         best_frame_id = select_best_frame_for_labeling(instance_masks, colors)
         frame_image = colors[best_frame_id]
 
         annotated, category_to_display_ids = create_id_labeled_image(
-            frame_image, instance_masks, categories_and_relations, display_id_offset
+            frame_image, instance_masks, categories_and_relations, display_id_offset,
+            best_frame_id=best_frame_id
         )
 
         id_scene_path = os.path.join(output_dir, "id_scene.png")
@@ -561,26 +571,30 @@ def infer_relations_scene_graph(
 
     if not object_ids:
         print("   ⚠️ 无可见物体，跳过场景图推断", flush=True)
-        return dict(categories_and_relations)
+        return dict(categories_and_relations), None
 
     print(f"   📋 推断 {len(object_ids)} 个物体的关系: {dict(zip(category_names, object_ids))}", flush=True)
 
     # ── Step 3: 加载VLM并推断 ──
-    try:
-        from transformers import AutoModelForVision2Seq, AutoProcessor
-    except ImportError:
+    if preloaded_vlm is not None:
+        model, processor = preloaded_vlm
+        print(f"   🤖 使用预加载VLM", flush=True)
+    else:
         try:
-            from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq, AutoProcessor
+            from transformers import AutoModelForVision2Seq, AutoProcessor
         except ImportError:
-            print("   ❌ 无法导入transformers，跳过场景图推断", flush=True)
-            return dict(categories_and_relations)
+            try:
+                from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq, AutoProcessor
+            except ImportError:
+                print("   ❌ 无法导入transformers，跳过场景图推断", flush=True)
+                return dict(categories_and_relations), None
 
-    print(f"   🤖 加载VLM: {vlm_checkpoint}", flush=True)
-    model = AutoModelForVision2Seq.from_pretrained(
-        vlm_checkpoint, torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True
-    )
-    model.eval()
-    processor = AutoProcessor.from_pretrained(vlm_checkpoint, trust_remote_code=True)
+        print(f"   🤖 加载VLM: {vlm_checkpoint}", flush=True)
+        model = AutoModelForVision2Seq.from_pretrained(
+            vlm_checkpoint, torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True
+        )
+        model.eval()
+        processor = AutoProcessor.from_pretrained(vlm_checkpoint, trust_remote_code=True)
 
     raw_output = infer_relations_from_scene_graph(
         model, processor, id_scene_path, object_ids, category_names
@@ -614,12 +628,8 @@ def infer_relations_scene_graph(
         }, f, indent=2, ensure_ascii=False)
     print(f"   💾 场景图关系已保存: {refined_json_path}", flush=True)
 
-    # 释放VLM内存
-    del model
-    del processor
-    torch.cuda.empty_cache()
-
-    return refined_relations
+    # 不卸载VLM, 返回给调用者供后续使用 (5.2 SP精修需要VLM判断精修程度)
+    return refined_relations, (model, processor)
 
 
 def _load_category_display_ids(scene_dir, categories_and_relations, display_id_offset=3):
@@ -726,7 +736,7 @@ def main():
 
     print(f"📋 原始关系: {json.dumps(categories_and_relations, ensure_ascii=False)}", flush=True)
 
-    refined = infer_relations_scene_graph(
+    refined, _ = infer_relations_scene_graph(
         scene_dir=args.scene_dir,
         vlm_checkpoint=args.vlm_checkpoint,
         categories_and_relations=categories_and_relations,

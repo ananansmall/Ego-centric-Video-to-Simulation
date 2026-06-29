@@ -376,7 +376,7 @@ def _print_position_diff(before, after, stage_name):
                   f"({b['centroid'].round(4)} → {a['centroid'].round(4)})", flush=True)
 
 
-def run_stage4(scene_dir, vggt_data, all_instances, args):
+def run_stage4(scene_dir, vggt_data, all_instances, args, categories_and_relations=None):
     """Stage 4: 视觉-空间对齐 (ICP + MASt3R)
 
     输入: VGGT depths/extrinsics/intrinsic/colors + all_instances
@@ -392,6 +392,16 @@ def run_stage4(scene_dir, vggt_data, all_instances, args):
     if vggt_data.get('intrinsic') is None:
         print("❌ VGGT 内参缺失, 无法运行 Stage 4", flush=True)
         return all_instances
+
+    # 加载 categories_and_relations (穿模修复需要)
+    if categories_and_relations is None:
+        import glob as _glob
+        s1_candidates = _glob.glob(os.path.join(scene_dir, "*_stage1.json"))
+        if not s1_candidates:
+            print("❌ 未找到 stage1 JSON, 无法运行穿模修复", flush=True)
+            return all_instances
+        with open(s1_candidates[0], 'r') as f:
+            categories_and_relations = json.load(f)
 
     from stage4.run_alignment import (
         reconstruct_world_points,
@@ -456,7 +466,8 @@ def run_stage4(scene_dir, vggt_data, all_instances, args):
     # Stage 4 后穿模修复
     from tools.refine_inter_object_placement import resolve_penetrations, check_stability
     all_instances = resolve_penetrations(all_instances, verbose=True,
-                                         categories_and_relations=categories_and_relations)
+                                         categories_and_relations=categories_and_relations,
+                                         scene_dir=scene_dir)
     all_instances, _ = check_stability(all_instances, verbose=True,
                                        categories_and_relations=categories_and_relations)
 
@@ -639,7 +650,8 @@ def main(args):
 
     if do_stage4:
         pos_before_s4 = _snapshot_positions(all_instances)
-        all_instances = run_stage4(scene_dir, vggt_data, all_instances, args)
+        all_instances = run_stage4(scene_dir, vggt_data, all_instances, args,
+                                    categories_and_relations=categories_and_relations)
         pos_after_s4 = _snapshot_positions(all_instances)
         _print_position_diff(pos_before_s4, pos_after_s4, "Stage 4")
         import pickle

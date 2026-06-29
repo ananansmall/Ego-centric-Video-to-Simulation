@@ -163,6 +163,9 @@ from src.models import load_vggt_model, load_vggt_omega_model, load_vggt4d_model
 from src.utils import load_video_frames, vis_instance_masks
 from src.geometry_utils import (
     align_to_room_coordinate_system,
+    align_via_objects,
+    align_via_large_plane,
+    align_via_geocalib,
     align_vggt_predictions,
     get_optimal_view_frame_id,
     get_walls_info,
@@ -355,10 +358,60 @@ def run_stage2(input_video, output_path, categories_and_relations, max_frames=12
     wall_masks, floor_masks = segment_wall_and_floor(
         vggt_prediction_results['colors'], sam3_image_model
     )
+
+    # 四阶段坐标系对齐 (Stage1 严格 → Stage2 放宽 → Stage3 大平面 → Stage4 GeoCalib)
     R, t = align_to_room_coordinate_system(
         vggt_prediction_results['world_points'], wall_masks, floor_masks
     )
+    alignment_stage = "stage1_strict"
+    alignment_info = {}
+
+    if np.allclose(R, np.eye(3), atol=1e-6):
+        print("   Stage1 (strict) 失败, 尝试 Stage2 (relaxed)...", flush=True)
+        R, t, alignment_info = align_via_objects(
+            vggt_prediction_results['world_points'], wall_masks, floor_masks
+        )
+        alignment_stage = "stage2_relaxed"
+
+    if np.allclose(R, np.eye(3), atol=1e-6):
+        print("   Stage2 (relaxed) 失败, 尝试 Stage3 (large_plane)...", flush=True)
+        R, t, alignment_info = align_via_large_plane(
+            vggt_prediction_results['world_points'], floor_masks
+        )
+        alignment_stage = "stage3_large_plane"
+
+    if np.allclose(R, np.eye(3), atol=1e-6):
+        print("   Stage3 (large_plane) 失败, 尝试 Stage4 (GeoCalib)...", flush=True)
+        R, t, alignment_info = align_via_geocalib(
+            vggt_prediction_results['colors'],
+            vggt_prediction_results['world_points'],
+            extrinsics=vggt_prediction_results['extrinsics'],
+            max_frames=8,
+        )
+        alignment_stage = "stage4_geocalib"
+
+    print(f"   坐标系对齐完成: {alignment_stage} (R[2,2]={R[2,2]:.4f})", flush=True)
+
+    # 保存坐标系对齐变换 (供 pose_changes.json 合并 + 调试追溯)
+    extrinsics_before = vggt_prediction_results['extrinsics'].copy()
     vggt_prediction_results = align_vggt_predictions(vggt_prediction_results, R, t)
+    extrinsics_after = vggt_prediction_results['extrinsics']
+
+    coord_align_info = {
+        "alignment_stage": alignment_stage,
+        "R": R.tolist(),
+        "t": t.tolist(),
+        "method_detail": alignment_info,
+        "extrinsics_before_first_frame": extrinsics_before[0].tolist(),
+        "extrinsics_after_first_frame": extrinsics_after[0].tolist(),
+        "n_frames": int(extrinsics_before.shape[0]),
+        "extrinsics_convention": "w2c (world→camera): p_cam = R @ p_world + t",
+        "camera_position_formula": "cam_pos = -R_w2c.T @ t_w2c (不是 t 本身)",
+    }
+    coord_align_path = os.path.join(output_path, "coordinate_alignment.json")
+    with open(coord_align_path, 'w') as f:
+        json.dump(coord_align_info, f, indent=2, ensure_ascii=False)
+    print(f"   💾 坐标系对齐信息已保存: {coord_align_path}", flush=True)
 
     # 保存VGGT中间结果（供Stage4和调试使用）
     os.makedirs(os.path.join(output_path, 'color'), exist_ok=True)
@@ -472,7 +525,6 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
                 static_count += 1
             print(f"   {category}_{inst_idx}: [{tag}] median_disp={motion_info['median_disp']}m, "
                   f"max_disp={motion_info['max_disp']}m, "
-                  f"global_disp={motion_info['global_disp']}m, "
                   f"valid_frames={motion_info['num_valid_frames']} → frame {optimal_frame_id}", flush=True)
 
     print(f"\n   📊 动态/静态统计: {dynamic_count} 动态, {static_count} 静态", flush=True)
@@ -542,6 +594,21 @@ def run_stage3(output_path, vggt_prediction_results, deduplicated_all_masks):
 
             if not is_dynamic_inst:
                 continue
+
+            # ── 点云清理: 动态物体只保留首帧点云, 剔除其他帧的点云 ──
+            # 动态物体在运动, 其他帧的点云是"残影", 会污染下游 (SP精修/Stage4/对齐)
+            # 保留 first_visible_frame_id 的点云 (物体放置位置), 其余帧该实例 mask 区域置 NaN
+            cleaned_count = 0
+            for im_entry in sorted_masks:
+                fid_clean = im_entry['frame_id']
+                if fid_clean == first_visible_frame_id:
+                    continue
+                mask_clean = im_entry['mask']
+                vggt_prediction_results['world_points'][fid_clean][mask_clean > 0] = np.nan
+                cleaned_count += 1
+            if cleaned_count > 0:
+                print(f"   {category}_{inst_idx}: [DYNAMIC] 点云清理: 保留首帧{first_visible_frame_id}, "
+                      f"剔除其他 {cleaned_count} 帧的实例点云", flush=True)
 
             first_visible_centroid = None
             optimal_centroid = None
@@ -723,13 +790,14 @@ def run_stage5(output_path, categories_and_relations, all_instances,
 
     walls_info = get_walls_info(vggt_prediction_results['world_points'], wall_masks)
     refined_relations = dict(categories_and_relations)
+    vlm_for_stage52 = None
 
     # ── 5.1: 关系推断 ──
     _t51 = time.time()
     if stage5_method == "scene_graph":
         print("\n   📍 5.1: 场景图关系推断 (SimRecon风格)", flush=True)
         from tools.infer_relations_scene_graph import infer_relations_scene_graph
-        refined_relations = infer_relations_scene_graph(
+        refined_relations, vlm_for_stage52 = infer_relations_scene_graph(
             scene_dir=output_path,
             vlm_checkpoint=vlm_checkpoint,
             categories_and_relations=categories_and_relations,
@@ -778,6 +846,7 @@ def run_stage5(output_path, categories_and_relations, all_instances,
             vlm_checkpoint=vlm_checkpoint,
             scene_dir=output_path,
             only_refine_other_objects=True,
+            preloaded_vlm=vlm_for_stage52,
         )
     else:
         print("\n   📍 5.2: 无物体间支撑关系，跳过精修", flush=True)
@@ -1046,7 +1115,8 @@ def main(args):
             deduplicated_all_masks=deduplicated_all_masks,
         )
         from tools.refine_inter_object_placement import resolve_penetrations
-        all_instances = resolve_penetrations(all_instances, categories_and_relations, verbose=True, dry_run=True)
+        all_instances = resolve_penetrations(all_instances, categories_and_relations, verbose=True,
+                                             dry_run=True, scene_dir=args.output_path)
         save_final_glb(all_instances, args.output_path, "final_scene_stage4.glb")
         import pickle as _pkl
         s4_pkl_path = os.path.join(args.output_path, "all_instances_stage4.pkl")
@@ -1153,10 +1223,34 @@ def main(args):
     with open(os.path.join(args.output_path, "final_relations.json"), 'w') as f:
         json.dump(refined_relations, f, indent=2, ensure_ascii=False)
 
-    # 保存位姿变化JSON (每个物体在各阶段的位置历史)
+    # 保存位姿变化JSON (每个物体在各阶段的位置历史 + 坐标系对齐变换 + 相机外参变化)
     pose_path = os.path.join(args.output_path, "pose_changes.json")
+    # 合并坐标系对齐信息 (由 run_stage2 保存的 coordinate_alignment.json)
+    coord_align_path = os.path.join(args.output_path, "coordinate_alignment.json")
+    if os.path.exists(coord_align_path):
+        with open(coord_align_path, 'r') as f:
+            coord_align = json.load(f)
+        # 提取所有帧的相机外参变化 (从 extrinsics/ 目录读取原始外参, 与对齐后对比)
+        extrinsics_dir = os.path.join(args.output_path, "extrinsics")
+        camera_changes = []
+        if os.path.isdir(extrinsics_dir):
+            for i in range(coord_align.get("n_frames", 0)):
+                ext_file = os.path.join(extrinsics_dir, f"{i}.txt")
+                if os.path.exists(ext_file):
+                    ext_aligned = np.loadtxt(ext_file)
+                    camera_changes.append({
+                        "frame_id": i,
+                        "extrinsic_aligned": ext_aligned.tolist(),
+                    })
+        pose_output = {
+            "coordinate_alignment": coord_align,
+            "camera_extrinsics_after_alignment": camera_changes,
+            "objects": pose_history,
+        }
+    else:
+        pose_output = pose_history
     with open(pose_path, 'w') as f:
-        json.dump(pose_history, f, indent=2, ensure_ascii=False)
+        json.dump(pose_output, f, indent=2, ensure_ascii=False)
     print(f"💾 位姿变化已保存: {pose_path}", flush=True)
 
     # 确定最终GLB路径用于日志输出

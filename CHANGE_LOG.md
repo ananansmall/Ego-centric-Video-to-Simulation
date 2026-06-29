@@ -29,6 +29,27 @@
 
 ---
 
+## [2026-06-24] - 修复 Stage5 `refined_relations` tuple 未解包 bug + 新增中间变量检查规则
+
+### 核心问题
+1. `mainv2.py` 启用 `--enable_stage5 --stage5_method scene_graph` 时，`infer_relations_scene_graph()` 返回 `(refined_relations, vlm_or_None)` tuple，但 `run_stage5()` 直接赋值给 `refined_relations`，后续 `.values()` 调用触发 `AttributeError: 'tuple' object has no attribute 'values'`。
+2. `tools/infer_relations_scene_graph.py` 的独立入口 `main()` 存在同样的 tuple 未解包问题。
+3. `.trae/rules/project_rules.md` 缺少对中间变量类型检查的明确要求。
+
+### Changed
+- **mainv2.py**: `run_stage5()` 解包 `infer_relations_scene_graph()` 返回值
+  - `refined_relations = infer_relations_scene_graph(...)` → `refined_relations, vlm_for_stage52 = infer_relations_scene_graph(...)`
+  - 新增 `vlm_for_stage52 = None`，保证 `per_object` 分支也能安全进入 5.2
+  - 5.2 调用 `refine_inter_object_relations(..., preloaded_vlm=vlm_for_stage52)`，复用 5.1 已加载的 VLM，避免重复加载
+- **tools/infer_relations_scene_graph.py**: 独立入口 `main()` 改为 `refined, _ = infer_relations_scene_graph(...)`，避免保存 tuple 到 JSON
+- **.trae/rules/project_rules.md**: 新增第 6 条“测试代码与中间变量”，要求对关键中间变量做最小断言/类型检查
+- **docs/questions.md**: 新增 Q61、Q62 记录本 bug 根因与修复
+
+### Docs to Review
+- 无需额外同步
+
+---
+
 ## [2026-06-18] - 修复3个运行时问题 + 重写mainv2技术文档
 
 ### 核心问题
@@ -417,5 +438,123 @@ pose_changes.json 结构验证: 15个物体, 3阶段(initial/basic_refinement/st
 
 ### ⚠️ Docs to Review
 - docs/mainv2_technical_doc.md: SP精修策略变更 (0.3m阈值移除)
+
+---
+
+## [2026-06-24 15:00] - ForeHOI 参考价值分析文档
+
+### 任务
+分析 ForeHOI (arXiv:2602.06226) 开源项目对 ReplicateAnyScene 全场景建立的参考价值，生成分析文档。
+
+### Added
+- **docs/ForeHOI_reference_analysis.md**: ForeHOI 对 RAS 的参考价值分析文档
+  - ForeHOI 核心能力概述（3D物体重建+2D遮罩修复+6DoF位姿）
+  - 与 RAS 的定位对比（物体级 vs 场景级）
+  - 5个维度的参考价值分析（2D遮罩修复★★★★★ > 手部特征编码★★★★ > 6DoF跟踪★★★ > 合成数据集★★★ > 3D骨干★★）
+  - 不适用部分说明
+  - 推荐行动计划
+  - 与 Do as I Do / FoundationPose 的横向对比
+  - ForeHOI 技术细节备忘
+
+### Changed
+- **docs/questions.md**: 新增 Q60 (ForeHOI 参考价值分析)，追加到第二十四章
+
+### 核心结论
+ForeHOI 在**手部遮挡下的物体遮罩修复**这一细分问题上提供最专业的解法（双向交叉注意力），是 RAS 当前最迫切需要解决的痛点。但在场景级重建、6DoF 跟踪、retargeting 等方面，Do as I Do 参考价值更大。建议将 ForeHOI 定位为**手部遮挡问题的专项参考**。
+
+### ⚠️ Docs to Review
+- 无需额外同步
+
+---
+
+## [2026-06-25 13:45] - 四阶段对齐模块测试 + hoi4d_vggt_omega 输出分析
+
+### Added
+- `test_alignment_basic_pick_place.py`: 独立测试四阶段房间坐标系对齐模块的脚本。从 `assets/basic_pick_place` 随机选 5 个视频，对每个视频运行 VGGT-Omega 重建 + SAM3 floor/wall 分割 + 4 个对齐阶段（align_to_room_coordinate_system / align_via_objects / align_via_large_plane / align_via_geocalib），输出 JSON 报告。已通过 py_compile 语法检查和实际运行（5 视频全部处理完成）。
+
+### Changed
+- `docs/questions.md`: 追加 Q63-Q66（6个GLB文件说明、Stage4效果分析、穿模修复问题、四阶段对齐测试结果）
+
+### ⚠️ Docs to Review
+- `docs/coordinate_and_alignment.md`: 需补充四阶段对齐的 fallback 逻辑说明，当前 mainv2.py 只用 Stage1 未接入 Stage2-4
+- `TECHNICAL_DOCUMENTATION.md`: 需说明 GeoCalib 权重需预下载（本机无网络时 Stage4 不可用）
+- `docs/mainv2_technical_doc.md`: 需补充 GLB 文件命名规范（6个GLB的最终/中间产物区分）
+
+---
+
+## [2026-06-25 16:30] - 四阶段对齐接入 mainv2 + GeoCalib gravity 方向修复
+
+### 任务
+1. 把 `geometry_utils.py` 中的四阶段坐标系对齐接入 `mainv2.py`，Stage 1（严格）保持不变，Stage 1 失败时级联到 Stage 2-4
+2. 修复 GeoCalib gravity 方向 bug：用户指出"重力不应该是 z 轴向下吗"，确认 GeoCalib 返回的 `gravity.vec3d` 指向 DOWN，但原代码误将其作为 `floor_normal`（应指向 UP）
+
+### Changed
+
+- **src/geometry_utils.py** (`align_via_geocalib`, 行 649-672):
+  - **gravity 方向修复**：GeoCalib 的 `gravity.vec3d` 返回重力方向（指向 DOWN，由 `geocalib/gravity.py` 中 `from_rp(roll=0, pitch=0)` 返回 `[0,-1,0]` 验证）
+  - 原代码：`floor_normal = final_vec.numpy()` （错误地把 DOWN 当 UP）
+  - 新代码：`gravity_vec = final_vec.numpy()` + `floor_normal = -gravity_vec / np.linalg.norm(gravity_vec)` （取反得到 UP）
+  - return dict 增加 `floor_normal` 字段便于调试
+
+- **mainv2.py** (imports 行 164-172 + run_stage2 行 358-393):
+  - imports 新增 `align_via_objects`, `align_via_large_plane`, `align_via_geocalib`
+  - `run_stage2()` 坐标系对齐改为四阶段级联：Stage1 严格 → Stage2 放宽 → Stage3 大平面 → Stage4 GeoCalib
+  - 每阶段失败（`np.allclose(R, np.eye(3), atol=1e-6)`）才进入下一阶段
+  - 日志输出 `alignment_stage` 和 `R[2,2]` 便于诊断
+
+### 验证
+
+**语法检查**：
+```
+python3 -m py_compile mainv2.py → OK
+python3 -m py_compile src/geometry_utils.py → OK
+```
+
+**gravity 方向经验验证**（5 个 basic_pick_place 视频）：
+| 方案 | 平均 z>0 点占比 | 判定 |
+|---|---|---|
+| `floor_normal = gravity`（原错误） | 38.1% | z 轴朝下 ❌ |
+| `floor_normal = -gravity`（修复后） | 61.8% | z 轴朝上 ✅ |
+
+**四阶段级联测试**（5 视频全量重测，gravity 修复后）：
+| 视频 | walls | floors | S1 | S2 | S3 | S4(GeoCalib) | 首个成功 |
+|---|---|---|---|---|---|---|---|
+| 15.mp4 | 23 | 0 | ❌ | ❌ | ❌ | ✅ | stage4 |
+| 109.mp4 | 15 | 0 | ❌ | ❌ | ❌ | ✅ | stage4 |
+| 224.mp4 | 1 | 0 | ❌ | ❌ | ❌ | ✅ | stage4 |
+| 210.mp4 | 24 | 6 | ✅ | ✅ | ✅ | ✅ | stage1 |
+| 200.mp4 | 4 | 1 | ✅ | ✅ | ✅ | ✅ | stage1 |
+
+所有 5 视频的 Stage4 均验证 `floor_normal == -gravity` ✅
+
+**可视化输出**：`output_v2/alignment_test_basic_pick_place/vis_{15,109,224,210,200}.png`（每个 2×5 网格：原始+4 阶段 × 侧视图+俯视图，按 z 高度着色）
+
+### 关键发现
+
+- GeoCalib 作为 Stage4 是**关键 fallback**：3/5 桌面场景视频（无可见地面）Stage 1-3 全失败，仅靠 GeoCalib 从图像重力方向恢复 z 轴
+- GeoCalib 权重已预下载缓存：`/mnt/data_8THDD/lza/.cache/torch/hub/geocalib/pinhole.tar`（111MB，pinhole 模型）
+- gravity 向量是 GeoCalib 最易用错的 API：`vec3d` 返回 DOWN 方向，UP 需取反
+
+### ⚠️ Docs to Review
+- `docs/coordinate_and_alignment.md`: Phase 2 记录"当前 mainv2.py 只用 Stage1 未接入 Stage2-4"，现已接入四阶段级联，需更新说明
+- `TECHNICAL_DOCUMENTATION.md`: Phase 2 记录"GeoCalib 权重需预下载，本机无网络 Stage4 不可用"，现已预下载缓存，可补充缓存路径
+- `docs/mainv2_technical_doc.md`: run_stage2 流程变化（单阶段 → 四阶段级联），需更新管线说明
+
+---
+
+## [2026-06-25] - output_v2 全场景评估 + 数据准确性报告
+
+### Added
+- `output_v2/ASSESSMENT_REPORT.md`: 12 个场景的视觉质量 + 空间精度评估汇总报告（含表格、指标说明、关键发现）
+- `output_v2/121_C5_CellPhone_161deg_vggt_omega/assessment_results.json`: 新增评估结果（PSNR_masked=11.63dB, MaskIoU=0.8188）
+- `output_v2/121_C5_CellPhone_161deg_vggt_omega/rendered/`: 160 帧渲染图
+- `output_v2/hoi4d_vggt_omega/assessment_results.json`: 新增评估结果（PSNR_masked=16.77dB, MaskIoU=0.2928）
+- `output_v2/hoi4d1_vggt_omega/assessment_results.json`: 新增评估结果（PSNR_masked=16.77dB, MaskIoU=0.2928）
+
+### Changed
+- 无代码修改
+
+### ⚠️ Docs to Review
+- `assess/ASSESSMENT.md`: 当前仅记录 232 单场景结果，可补充 output_v2 批量评估结果引用
 
 ---

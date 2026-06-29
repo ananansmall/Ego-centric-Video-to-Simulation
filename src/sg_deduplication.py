@@ -266,35 +266,47 @@ def cross_category_deduplicate(all_masks, world_points, world_points_conf, conf_
             overlap_matrix[(i, j)] = (ov1, ov2)
 
             if uf.find(i) != uf.find(j):
-                should_merge = ov1 >= overlap_thre or ov2 >= overlap_thre
+                cat_i = all_candidates[i]["category"]
+                cat_j = all_candidates[j]["category"]
+                pts_i_count = len(all_candidates[i]["points"])
+                pts_j_count = len(all_candidates[j]["points"])
+                size_ratio = min(pts_i_count, pts_j_count) / max(pts_i_count, pts_j_count)
+
+                centroid_dist = float(np.linalg.norm(
+                    np.mean(pts_i, axis=0) - np.mean(pts_j, axis=0)
+                ))
+
+                # 同位置去重: 质心距离 < 0.03m 说明两个物体几乎在同一位置
+                # 降低 overlap 阈值 (×0.5), 捕获 moderate-overlap 的同位置重复
+                effective_thre = overlap_thre
+                same_position = centroid_dist < 0.03 and cat_i != cat_j and size_ratio >= 0.4
+                if same_position:
+                    effective_thre = overlap_thre * 0.5
+
+                should_merge = ov1 >= effective_thre or ov2 >= effective_thre
 
                 # 跨类去重保护: 不同类别的物体，如果面积差异大，不应合并
                 # 场景: 小物体(eye/scissor)放在大物体(table)上，3D空间重叠度高
                 # 但它们是不同物体，不应被吞并
-                cat_i = all_candidates[i]["category"]
-                cat_j = all_candidates[j]["category"]
-                if should_merge and cat_i != cat_j:
-                    pts_i_count = len(all_candidates[i]["points"])
-                    pts_j_count = len(all_candidates[j]["points"])
-                    size_ratio = min(pts_i_count, pts_j_count) / max(pts_i_count, pts_j_count)
-                    # 如果小物体点数不到大物体的 40%，且只有单方向 overlap 高，
-                    # 说明是小物体放在大物体上，不应合并
-                    if size_ratio < 0.4:
-                        # 只有双向 overlap 都高才合并 (说明确实是同一个物体)
-                        should_merge = ov1 >= overlap_thre and ov2 >= overlap_thre
-                        if not should_merge and (ov1 >= overlap_thre or ov2 >= overlap_thre):
-                            cross_merge_details.append(
-                                f"    🛡️ {cat_i}_{i} + {cat_j}_{j} 跨类保护: "
-                                f"size_ratio={size_ratio:.2f}, ov1={ov1:.3f}, ov2={ov2:.3f} → 不合并"
-                            )
+                if should_merge and cat_i != cat_j and size_ratio < 0.4 and not same_position:
+                    # 只有双向 overlap 都高才合并 (说明确实是同一个物体)
+                    should_merge = ov1 >= overlap_thre and ov2 >= overlap_thre
+                    if not should_merge and (ov1 >= overlap_thre or ov2 >= overlap_thre):
+                        cross_merge_details.append(
+                            f"    🛡️ {cat_i}_{i} + {cat_j}_{j} 跨类保护: "
+                            f"size_ratio={size_ratio:.2f}, ov1={ov1:.3f}, ov2={ov2:.3f}, "
+                            f"centroid_dist={centroid_dist:.4f}m → 不合并"
+                        )
 
                 if should_merge:
                     uf.union(i, j)
                     reason = []
-                    if ov1 >= overlap_thre:
-                        reason.append(f"ov1={ov1:.3f}>={overlap_thre}")
-                    if ov2 >= overlap_thre:
-                        reason.append(f"ov2={ov2:.3f}>={overlap_thre}")
+                    if ov1 >= effective_thre:
+                        reason.append(f"ov1={ov1:.3f}>={effective_thre:.3f}")
+                    if ov2 >= effective_thre:
+                        reason.append(f"ov2={ov2:.3f}>={effective_thre:.3f}")
+                    if same_position:
+                        reason.append(f"same_pos(dist={centroid_dist:.4f}m)")
                     cross_merge_details.append(f"    {cat_i}_{i} + {cat_j}_{j} ← {', '.join(reason)}")
     final_groups = {}
     for i in range(N):

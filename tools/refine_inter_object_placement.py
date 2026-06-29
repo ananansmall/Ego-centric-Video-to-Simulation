@@ -730,19 +730,18 @@ def sp_refine_on_top(supported_info, supporter_info, max_offset=0.3, initial_off
 
     # 根据精修程度决定调整策略
     if refinement_degree == "minor":
-        # 小精修: 限制最大移动距离, 避免过度调整
+        reason = "小精修"
         max_minor_move = 0.15
         if abs(z_offset) > max_minor_move:
-            # 超过小精修范围, 截断到最大距离
             z_offset = max_minor_move if z_offset > 0 else -max_minor_move
             print(f"      [on_top] 小精修: z_offset截断到 {z_offset:+.4f}m", flush=True)
         else:
             print(f"      [on_top] 小精修: z_offset={z_offset:+.4f}m", flush=True)
     elif refinement_degree == "major":
-        # 大精修: 始终执行完整 z 轴贴合
+        reason = "大精修"
         print(f"      [on_top] 大精修: z_offset={z_offset:+.4f}m, 完整贴合", flush=True)
     else:
-        # 默认 (无VLM判断): 始终执行完整 z 轴贴合
+        reason = "默认精修"
         print(f"      [on_top] z_offset={z_offset:+.4f}m, 贴合支撑物顶面", flush=True)
 
     # 应用 z 轴平移
@@ -1180,7 +1179,7 @@ def _check_mesh_penetration_legacy(mesh_a, mesh_b, n_samples=500):
 
 def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
                          categories_and_relations=None, dry_run=False,
-                         max_iterations=8):
+                         max_iterations=8, scene_dir=None):
     """全局穿模检测与解决
 
     策略:
@@ -1189,6 +1188,7 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
       3. 推开后确保不穿出地面(z=0)
       4. 迭代直到无穿模或达到最大迭代次数
       5. 大物体穿模: 增加分离余量 (按穿模深度比例增加)
+      6. 层级修复: 小物体 (parent != floor) 只 z 轴移动, 跟随 supporter x,y
 
     参数:
         all_instances: {category: [instance_info, ...]}
@@ -1196,6 +1196,8 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
         verbose: 是否打印详细信息
         dry_run: 如果为True, 只检测和警告, 不实际修改T矩阵
         max_iterations: 最大迭代次数 (默认8, 比旧版5更多)
+        scene_dir: 场景目录路径. 若提供, 尝试加载 relations_scene_graph.json,
+                   使用 scene_graph_objects 的 parent 层级确定大小物体 (比字符串解析更可靠)
     返回:
         更新后的 all_instances
     """
@@ -1217,14 +1219,89 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
             base = name.rsplit('_', 1)[0] if '_' in name else name
             supported_names.add(base.lower().strip())
             supported_names.add(name.lower().strip())
-        if "floor" in rel_lower:
+        # 注意: 只有当物体本身就是 floor/wall (rel == "floor"/"wall") 时才算结构元素.
+        # "supported by floor" 的物体 (如 table, cabinet) 是放在地板上的家具,
+        # 它们之间应该正常检测穿模, 不能跳过.
+        if rel_lower == "floor" or name.lower() == "floor":
             base = name.rsplit('_', 1)[0] if '_' in name else name
             floor_names.add(base.lower().strip())
             floor_names.add(name.lower().strip())
-        if "wall" in rel_lower:
+        if rel_lower == "wall" or name.lower() == "wall":
             base = name.rsplit('_', 1)[0] if '_' in name else name
             wall_names.add(base.lower().strip())
             wall_names.add(name.lower().strip())
+
+    # 构建 supporter→supported 映射, 用于层级穿模修复
+    # 当 supporter (大物体) 移动时, 其 supported (小物体) 跟随移动 x,y
+    # 小物体定义: scene_graph_objects 中 parent != 1 (floor) 的物体
+    supporter_to_supported = {}
+
+    # 方式 A (优先): 从 relations_scene_graph.json 加载 parent 层级
+    # 比 "supported by X" 字符串解析更可靠, 直接使用 scene graph 的 parent ID
+    sg_loaded = False
+    if scene_dir:
+        sg_path = os.path.join(scene_dir, "relations_scene_graph.json")
+        if os.path.isfile(sg_path):
+            try:
+                with open(sg_path, 'r') as f:
+                    sg_data = json.load(f)
+                sg_objects = sg_data.get("scene_graph_objects", [])
+                cat_to_ids = sg_data.get("category_to_display_ids", {})
+                # 构建 display_id → (category, instance_idx) 映射
+                display_to_inst = {}
+                for cat, ids in cat_to_ids.items():
+                    for inst_idx, did in enumerate(ids):
+                        display_to_inst[did] = (cat.lower().strip(), inst_idx)
+                # 用 parent 层级构建 supporter_to_supported
+                # parent=1 → floor (大物体/supporter); parent=其他 → 小物体 (supported)
+                for obj in sg_objects:
+                    parent = obj.get("parent", 1)
+                    if parent == 1:  # floor → 大物体, 跳过
+                        continue
+                    supported_did = obj["id"]
+                    supporter_did = parent
+                    if supported_did not in display_to_inst or supporter_did not in display_to_inst:
+                        continue
+                    supported_key = display_to_inst[supported_did]
+                    supporter_key = display_to_inst[supporter_did]
+                    supporter_to_supported.setdefault(supporter_key, []).append(supported_key)
+                    # 同步更新 supported_names: 小物体 (parent != floor) 的类别加入 supported_names
+                    # 这样 move_is_supported 判定与层级修复一致
+                    supported_cat_name = supported_key[0]
+                    supported_names.add(supported_cat_name)
+                if supporter_to_supported and verbose:
+                    print(f"   📊 使用 scene_graph_objects parent 层级: "
+                          f"{len(supporter_to_supported)} 个 supporter → "
+                          f"{sum(len(v) for v in supporter_to_supported.values())} 个 supported", flush=True)
+                sg_loaded = True
+            except Exception as e:
+                if verbose:
+                    print(f"   ⚠️ 加载 relations_scene_graph.json 失败: {e}, 回退到字符串解析", flush=True)
+
+    # 方式 B (回退): 从 refined_relations 字符串解析 "supported by X"
+    if not sg_loaded:
+        for name, rel in _all_rels.items():
+            if rel.startswith("supported by ") and "floor" not in rel.lower() and "other objects" not in rel.lower():
+                supporter_name = rel[len("supported by "):].strip()
+                if '_' in supporter_name:
+                    s_cat, s_idx_str = supporter_name.rsplit('_', 1)
+                    try:
+                        s_idx = int(s_idx_str)
+                    except ValueError:
+                        continue
+                else:
+                    continue
+                if '_' in name:
+                    d_cat, d_idx_str = name.rsplit('_', 1)
+                    try:
+                        d_idx = int(d_idx_str)
+                    except ValueError:
+                        continue
+                else:
+                    continue
+                key = (s_cat.lower().strip(), s_idx)
+                val = (d_cat.lower().strip(), d_idx)
+                supporter_to_supported.setdefault(key, []).append(val)
 
     all_meshes = []
     for category, instances in all_instances.items():
@@ -1273,6 +1350,7 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
                         print(f"      ⚠️ 穿模警告: {pair_desc} | {axis_name}轴 穿模深度 {pen_depth:.4f}m", flush=True)
                     continue
 
+                # --- 层级穿模修复: floor → 大物体 → 小物体 ---
                 if cat_i_is_supported and not cat_j_is_supported:
                     move_idx = i
                 elif cat_j_is_supported and not cat_i_is_supported:
@@ -1292,6 +1370,15 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
                 move_cat, move_idx_orig, move_mesh, move_info = all_meshes[move_idx]
                 other_mesh = mesh_j if move_idx == i else mesh_i
 
+                move_is_supported = cat_i_is_supported if move_idx == i else cat_j_is_supported
+                other_is_supported = cat_j_is_supported if move_idx == i else cat_i_is_supported
+                both_small = move_is_supported and other_is_supported
+
+                # 小物体 (supported) 不独立调整 x,y: 强制 z 轴移动
+                if move_is_supported and sep_axis != 2:
+                    sep_axis = 2
+                    axis_name = 'z'
+
                 move_center = move_mesh.bounds.mean(axis=0)[sep_axis]
                 other_center = other_mesh.bounds.mean(axis=0)[sep_axis]
 
@@ -1300,23 +1387,23 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
                 else:
                     direction = -1.0
 
-                # 大物体穿模: 增加分离余量
-                # 基础: pen_depth + 0.01m
-                # 大物体 (最大维度 > 0.3m): 增加余量到 pen_depth + 0.05m
-                # 超大物体 (最大维度 > 0.5m): 增加余量到 pen_depth + 0.10m
+                # 分离余量: 小物体之间更小
                 move_size = np.max(move_mesh.bounds[1] - move_mesh.bounds[0])
                 other_size = np.max(other_mesh.bounds[1] - other_mesh.bounds[0])
                 max_size = max(move_size, other_size)
-                if max_size > 0.5:
-                    # 超大物体 (柜子/桌子等): 大幅分离
+                if both_small:
+                    sep_dist = pen_depth + 0.005
+                elif max_size > 0.5:
                     sep_dist = pen_depth + 0.10
                 elif max_size > 0.3:
-                    # 大物体: 中等分离
                     sep_dist = pen_depth + 0.05
                 else:
                     sep_dist = pen_depth + 0.01
+
                 translation_vec = np.array([0.0, 0.0, 0.0])
                 translation_vec[sep_axis] = direction * sep_dist
+
+                old_pos = move_info["T"][:3, 3].copy()
 
                 new_T = trimesh.transformations.translation_matrix(translation_vec) @ move_info["T"]
                 move_info["T"] = new_T
@@ -1332,9 +1419,30 @@ def resolve_penetrations(all_instances, refined_relations=None, verbose=True,
                 all_meshes[move_idx] = (move_cat, move_idx_orig, new_mesh, move_info)
                 all_instances[move_cat][move_idx_orig] = move_info
 
+                # 层级传播: supporter (大物体) 移动时, supported (小物体) 跟随 x,y
+                if not move_is_supported:
+                    new_pos = move_info["T"][:3, 3]
+                    xy_delta = np.array([new_pos[0] - old_pos[0], new_pos[1] - old_pos[1], 0.0])
+                    if np.linalg.norm(xy_delta[:2]) > 1e-6:
+                        supporter_key = (move_cat.lower().strip(), move_idx_orig)
+                        for s_cat, s_idx in supporter_to_supported.get(supporter_key, []):
+                            if s_cat not in all_instances or s_idx >= len(all_instances[s_cat]):
+                                continue
+                            s_info = all_instances[s_cat][s_idx]
+                            s_info["T"] = trimesh.transformations.translation_matrix(xy_delta) @ s_info["T"]
+                            for m_idx in range(len(all_meshes)):
+                                m_cat, m_idx_orig, _, _ = all_meshes[m_idx]
+                                if m_cat.lower().strip() == s_cat and m_idx_orig == s_idx:
+                                    all_meshes[m_idx] = (m_cat, m_idx_orig, _get_transformed_mesh(s_info), s_info)
+                                    break
+                            if verbose:
+                                print(f"      📎 层级跟随: {s_cat}_{s_idx} 跟随 {move_cat}_{move_idx_orig} "
+                                      f"xy偏移 ({xy_delta[0]:+.4f}, {xy_delta[1]:+.4f})", flush=True)
+
                 any_resolved = True
                 if verbose:
-                    print(f"      🔧 穿模修复: {pair_desc} | {axis_name}轴分离 {sep_dist:.4f}m", flush=True)
+                    extra = " (z-only, 小物体)" if move_is_supported and sep_axis == 2 else ""
+                    print(f"      🔧 穿模修复: {pair_desc} | {axis_name}轴分离 {sep_dist:.4f}m{extra}", flush=True)
 
         if not dry_run and not any_resolved:
             break
@@ -1580,17 +1688,40 @@ def check_stability(all_instances, refined_relations=None, categories_and_relati
 
 
 def _find_supporter_info(all_instances, supporter_name, supporter_cat):
-    """在all_instances中查找支撑物的instance_info"""
-    if supporter_name in all_instances and all_instances[supporter_name]:
-        return all_instances[supporter_name][0]
+    """在all_instances中查找支撑物的instance_info
+
+    supporter_name 可能是 "table_1" (带实例索引) 或 "table" (不带).
+    all_instances 的 key 是类别名 (如 "table"), value 是实例列表.
+    当 supporter_name 带索引时, 解析出索引返回对应实例, 而非总是 [0].
+    """
+    # 解析实例索引: "table_1" → cat="table", idx=1
+    inst_idx = None
+    if "_" in supporter_name:
+        parts = supporter_name.rsplit("_", 1)
+        if parts[1].isdigit():
+            inst_idx = int(parts[1])
+
+    # 按类别查找实例列表
+    instances = None
     if supporter_cat in all_instances and all_instances[supporter_cat]:
-        return all_instances[supporter_cat][0]
-    for cat, instances in all_instances.items():
-        cat_base = cat.rsplit("_", 1)[0] if "_" in cat else cat
-        if cat_base.lower() == supporter_cat.lower() or cat.lower() == supporter_name.lower():
-            if instances:
-                return instances[0]
-    return None
+        instances = all_instances[supporter_cat]
+    else:
+        for cat, insts in all_instances.items():
+            cat_base = cat.rsplit("_", 1)[0] if "_" in cat else cat
+            if cat_base.lower() == supporter_cat.lower() or cat.lower() == supporter_name.lower():
+                if insts:
+                    instances = insts
+                    break
+
+    if not instances:
+        return None
+
+    # 有明确索引且在范围内 → 返回对应实例
+    if inst_idx is not None and 0 <= inst_idx < len(instances):
+        return instances[inst_idx]
+
+    # 无索引或索引越界 → 回退到 [0]
+    return instances[0]
 
 
 def _project_footprint(mesh):
@@ -1610,7 +1741,8 @@ def refine_inter_object_relations(all_instances, refined_relations,
                                   categories_and_relations=None,
                                   only_refine_other_objects=False,
                                   initial_T_snapshot=None,
-                                  final_glb_name="final_scene_stage5.glb"):
+                                  final_glb_name="final_scene_stage5.glb",
+                                  preloaded_vlm=None):
     """
     主函数: 精修物体间支撑关系的空间位置
 
@@ -1725,8 +1857,13 @@ def refine_inter_object_relations(all_instances, refined_relations,
                 else:
                     print(f"      {inst_key}: ❌ 无帧", flush=True)
 
-        # 加载VLM
-        vlm_model, vlm_processor = _load_vlm_model(resolved_ckpt)
+        # 加载VLM (优先使用预加载的, 避免重复加载)
+        if preloaded_vlm is not None:
+            vlm_model, vlm_processor = preloaded_vlm
+            if verbose:
+                print(f"   🤖 使用预加载VLM", flush=True)
+        else:
+            vlm_model, vlm_processor = _load_vlm_model(resolved_ckpt)
 
         # 按实例投票判定策略
         for supported_name, supporter_name in supported_pairs:
@@ -1895,7 +2032,8 @@ def refine_inter_object_relations(all_instances, refined_relations,
 
     # ── 全局穿模解决 ──
     all_instances = resolve_penetrations(all_instances, refined_relations, verbose=verbose,
-                                         categories_and_relations=categories_and_relations)
+                                         categories_and_relations=categories_and_relations,
+                                         scene_dir=scene_dir)
 
     # 保存 SP精修+穿模修复后的中间结果 (GLB #3)
     if scene_dir is not None:

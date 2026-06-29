@@ -277,14 +277,33 @@ def align_to_room_coordinate_system(world_points, wall_masks, floor_masks, wall_
     return R, t
 
 
-def _orient_floor_normal(floor_normal, floor_centroid, all_points):
+def _estimate_floor_centroid(all_points, floor_normal, bottom_percentile=10):
+    """用 floor_normal 方向上最低的 N% 点的质心近似 floor_centroid.
+
+    比用整个点云质心更准确, 因为 floor 在场景底部.
     """
-    确保 floor_normal 朝上 (朝向场景上方).
-    用点云整体质心判断: floor 在底部, 场景质心在 floor 上方.
+    projections = all_points @ floor_normal
+    threshold = np.percentile(projections, bottom_percentile)
+    bottom_mask = projections <= threshold
+    return np.mean(all_points[bottom_mask], axis=0)
+
+
+def _orient_floor_normal(floor_normal, floor_centroid, all_points, camera_positions=None):
+    """确保 floor_normal 朝上 (朝向场景上方).
+
+    优先用点云质心判断 (floor 在底部, 场景质心在上方);
+    当 floor_centroid ≈ all_centroid (如 GeoCalib 阶段用 bottom-percentile 仍可能接近) 时,
+    用相机位置作为 "上方" 参考 (相机总在 floor 上方).
     """
     all_centroid = np.mean(all_points, axis=0)
-    if np.dot(all_centroid - floor_centroid, floor_normal) < 0:
-        return -floor_normal
+    diff = all_centroid - floor_centroid
+    if np.linalg.norm(diff) > 1e-6:
+        if np.dot(diff, floor_normal) < 0:
+            return -floor_normal
+    elif camera_positions is not None:
+        mean_cam = np.mean(camera_positions, axis=0)
+        if np.dot(mean_cam - floor_centroid, floor_normal) < 0:
+            return -floor_normal
     return floor_normal
 
 
@@ -542,18 +561,25 @@ def align_via_vlm_floor_points(world_points, images, sam3_image_model,
     }
 
 
-def align_via_geocalib(images, world_points, max_frames=8, mad_threshold=3.0):
+def align_via_geocalib(images, world_points, extrinsics, max_frames=8, mad_threshold=3.0):
     '''
     阶段4: 用 GeoCalib 从图像估计重力方向, 构造坐标系对齐.
 
-    参考 do-as-i-do/reconstruction/scripts/predict_video_gravity.py 的逻辑:
-      1. 对每帧图像运行 GeoCalib → 得到 gravity 向量 (相机坐标系下的"上"方向)
-      2. 置信度加权的球面平均 + MAD 异常值剔除 → 最终 gravity 向量
-      3. gravity 向量就是相机坐标系中"上"的方向 → 旋转对齐到世界 z 轴
+    关键修复: GeoCalib 返回的 gravity 是相机坐标系下的向量, 必须用 extrinsics
+    变换到世界坐标系后才能作为 floor_normal. 原代码直接用相机坐标系 gravity, 导致
+    R[2,2] 偏小 (如 scene15 的 R[2,2]=0.2259, z 轴偏 77°).
+
+    流程:
+      1. 对每帧图像运行 GeoCalib → 得到 gravity 向量 (相机坐标系, 指向 DOWN)
+      2. 用 extrinsics 将每帧 gravity 从相机坐标变换到世界坐标
+      3. 置信度加权的球面平均 + MAD 异常值剔除 → 世界坐标系下的 gravity
+      4. floor_normal = -gravity (UP), 用 bottom-percentile 估计 floor_centroid
+      5. 构造 R, t; 若 |R[2,2]| < 0.5 则判定对齐失败
 
     Args:
       images: numpy array of shape (S, H, W, 3), uint8 RGB
       world_points: (T, H, W, 3)
+      extrinsics: (N, 4, 4) or (N, 3, 4) w2c 外参, 与 images 帧数对应
       max_frames: 最多处理多少帧 (GeoCalib 推理较慢, 默认8帧)
       mad_threshold: MAD 异常值剔除阈值 (默认3.0)
 
@@ -581,28 +607,32 @@ def align_via_geocalib(images, world_points, max_frames=8, mad_threshold=3.0):
     else:
         indices = np.arange(S)
 
-    gravity_vecs = []
+    gravity_world_vecs = []  # 世界坐标系下的 gravity 向量
     confidences = []
     per_frame_info = []
 
     with torch.no_grad():
         for idx in indices:
             img = images[idx]
-            # numpy (H,W,3) uint8 → torch (1,3,H,W) float [0,1]
             img_tensor = torch.from_numpy(img).float().permute(2, 0, 1).unsqueeze(0) / 255.0
             img_tensor = img_tensor.to(device)
             try:
                 results = model.calibrate(img_tensor, camera_model="pinhole")
                 grav = results["gravity"]
-                vec = grav.vec3d.squeeze(0).cpu()  # [3] 相机坐标系下的重力方向
+                grav_cam = grav.vec3d.squeeze(0).cpu().numpy()  # [3] 相机坐标系, 指向 DOWN
                 up_conf = results["up_confidence"].mean().item()
                 lat_conf = results["latitude_confidence"].mean().item()
                 conf = (up_conf + lat_conf) / 2.0
-                gravity_vecs.append(vec)
+
+                R_w2c = extrinsics[idx, :3, :3]  # (3,3) world→camera rotation
+                grav_world = R_w2c.T @ grav_cam    # camera→world: R_c2w = R_w2c.T
+
+                gravity_world_vecs.append(grav_world)
                 confidences.append(conf)
                 per_frame_info.append({
                     'frame_id': int(idx),
-                    'vec': vec.numpy().tolist(),
+                    'grav_cam': grav_cam.tolist(),
+                    'grav_world': grav_world.tolist(),
                     'confidence': conf,
                 })
             except Exception as e:
@@ -611,17 +641,16 @@ def align_via_geocalib(images, world_points, max_frames=8, mad_threshold=3.0):
                     'error': str(e),
                 })
 
-    if len(gravity_vecs) == 0:
+    if len(gravity_world_vecs) == 0:
         return np.eye(3), np.zeros(3), {
             'reason': 'geocalib_no_frames',
             'n_attempted': len(indices),
             'per_frame': per_frame_info,
         }
 
-    vecs = torch.stack(gravity_vecs)  # [N, 3]
+    vecs = torch.from_numpy(np.stack(gravity_world_vecs)).float()  # [N, 3] world coords
     confs = torch.tensor(confidences)  # [N]
 
-    # 球面平均 + MAD 异常值剔除
     def spherical_mean(v, w=None):
         if w is not None:
             w = w / w.sum()
@@ -650,24 +679,52 @@ def align_via_geocalib(images, world_points, max_frames=8, mad_threshold=3.0):
     inlier_confs = confs[inlier_mask]
     final_vec = spherical_mean(inlier_vecs, w=inlier_confs)
 
-    # final_vec 是相机坐标系下的"上"方向 (gravity 向量)
-    # 我们需要构造 R, 使得 R @ final_vec ≈ [0, 0, 1] (世界 z 轴)
-    floor_normal = final_vec.numpy()  # [3]
-    floor_normal = floor_normal / np.linalg.norm(floor_normal)
+    # final_vec 是世界坐标系下的 gravity (DOWN), floor_normal = -gravity (UP)
+    gravity_world = final_vec.numpy()  # [3], world coords, points DOWN
+    floor_normal = -gravity_world / np.linalg.norm(gravity_world)  # negate → UP
 
-    # 用 _build_R_t_from_floor 构造 R, t
-    # floor_centroid 用点云质心近似
     all_points = world_points.reshape(-1, 3)
-    floor_centroid = np.mean(all_points, axis=0)
+    floor_centroid = _estimate_floor_centroid(all_points, floor_normal, bottom_percentile=10)
+
+    # VGGT extrinsics 是 w2c (world→camera): p_cam = R @ p_world + t
+    # 相机在世界坐标的位置 = -R.T @ t (不是 t 本身)
+    R_w2c_all = extrinsics[:, :3, :3]  # (N, 3, 3)
+    t_w2c = extrinsics[:, :3, 3]       # (N, 3)
+    camera_positions = -np.einsum('nji,nj->ni', R_w2c_all, t_w2c)  # (N, 3) cam_pos = -R.T @ t
+    floor_normal = _orient_floor_normal(
+        floor_normal, floor_centroid, all_points, camera_positions=camera_positions
+    )
 
     R, t = _build_R_t_from_floor(world_points, floor_normal, floor_centroid, wall_normal_1=None)
 
+    # 质量检查: R[2,2] = floor_normal[2], 理想值 ≈ ±1.0
+    # |R[2,2]| < 0.5 说明 floor 法线偏离竖直 > 60°, 对齐失败
+    if abs(R[2, 2]) < 0.5:
+        return np.eye(3), np.zeros(3), {
+            'reason': f'geocalib_poor_alignment R[2,2]={R[2,2]:.4f}',
+            'method': 'geocalib',
+            'gravity_world': gravity_world.tolist(),
+            'floor_normal': floor_normal.tolist(),
+            'floor_centroid': floor_centroid.tolist(),
+            'n_frames': len(vecs),
+            'n_inliers': n_inliers,
+            'per_frame': per_frame_info,
+            'extrinsics_convention': 'w2c (world→camera)',
+            'gravity_transform': 'grav_world = R_w2c.T @ grav_cam (= R_c2w @ grav_cam, camera→world)',
+            'camera_position_transform': 'cam_pos = -R_w2c.T @ t_w2c (w2c 的 t 不是相机位置)',
+        }
+
     return R, t, {
         'method': 'geocalib',
-        'gravity_vec': final_vec.numpy().tolist(),
+        'gravity_world': gravity_world.tolist(),
+        'floor_normal': floor_normal.tolist(),
+        'floor_centroid': floor_centroid.tolist(),
         'n_frames': len(vecs),
         'n_inliers': n_inliers,
         'per_frame': per_frame_info,
+        'extrinsics_convention': 'w2c (world→camera)',
+        'gravity_transform': 'grav_world = R_w2c.T @ grav_cam (= R_c2w @ grav_cam, camera→world)',
+        'camera_position_transform': 'cam_pos = -R_w2c.T @ t_w2c (w2c 的 t 不是相机位置)',
     }
 
 

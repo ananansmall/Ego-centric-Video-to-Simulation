@@ -1177,3 +1177,885 @@ Do as I Do 的管线架构值得参考：
 1. **用 TAPIR 替代 VGGT4D TrackHead 做点跟踪** — TAPIR 是 Google DeepMind 出品，比 VGGT4D 的 TrackHead 更成熟稳定，且有独立 conda env 避免 CUDA 冲突
 2. **用 GeoCalib 替代 PCA 做重力估计** — GeoCalib 不依赖 wall mask，对 VGGT 点云噪声更鲁棒
 3. **物体 mesh 凸分解** — 在 `physics_validator.py` 和 `scene_builder.py` 中加入凸分解，提升物理仿真碰撞检测精度
+
+---
+
+## 二十四、ForeHOI 参考价值分析
+
+### Q60: ForeHOI (arXiv:2602.06226) 对本项目的参考价值有哪些？
+
+**论文概述**: ForeHOI (港中深, 2026-02) 是首个从日常手-物交互视频中前馈式重建 3D 物体几何的方法。核心创新是双向交叉注意力（2D 遮罩修复分支 ↔ 3D 几何生成分支互相增强），解决手部严重遮挡下的物体重建问题。推理约 1 分钟，比优化类方法快 ~100 倍。
+
+**与本项目的关系**: 两个项目都处理手-物交互视频，但定位互补——ForeHOI 专注**物体级**重建（单物体 + 遮挡补全），RAS 专注**场景级**重建（多物体 + 空间关系）。ForeHOI 把手当作**重建先验**，RAS 把手当作**干扰源**。
+
+**参考价值分析（按优先级排序）**:
+
+#### 1. 2D 遮罩修复 → 解决 SAM3 手部遮挡问题（最高价值 ★★★★★）
+
+RAS 当前痛点（Q18/Q19）：SAM3 分割含手部 → mesh 含手部几何 → 位置偏移；去除手部后黑色区域无信息。
+
+ForeHOI 的 2D mask inpainting 分支可预测每帧完整物体遮罩（被遮挡区域已补全），直接替换 SAM3 的含手 mask。
+
+**推荐方案**: 待 ForeHOI 推理代码发布后，尝试用其 2D mask inpainting 替换 SAM3 手部区域 mask。
+
+#### 2. 手部特征编码思路 → 解决手部区域点云噪声（高价值 ★★★★☆）
+
+ForeHOI 用 HaMeR 提取手部特征，与 DINOv2 图像特征逐 patch 聚合，实现手部感知的特征融合。
+
+可借鉴思路：在 VGGT 后处理中，用手部估计结果标记手部区域，降低手部区域的点云置信度（而非直接丢弃）。
+
+#### 3. 6-DoF 位姿跟踪（中等价值 ★★★☆☆）
+
+ForeHOI 用渲染+比较后处理获得 6-DoF，与路线图中的 FoundationPose 思路类似但后者更成熟。此部分参考价值不如 Do as I Do 的 Fast-SAM3D guided diffusion。
+
+#### 4. 合成数据集（中等价值 ★★★☆☆）
+
+~400K 合成 HOI 视频序列（GraspXL + Objaverse + MANO），可用于微调 SAM3 手部分割或验证管线鲁棒性。但合成数据有域差距，且面向单物体。
+
+#### 5. 不适用的部分
+
+| ForeHOI 特性 | 不适用原因 |
+|-------------|----------|
+| 单物体假设 | RAS 需要多物体场景重建 |
+| 无场景坐标系 | RAS 需要全局坐标系对齐 |
+| 体素 64×64 分辨率 | RAS 的大物体需要更高精度 |
+| 代码未完全发布 | 推理/训练代码仍在 TODO |
+
+**与 Do as I Do 的对比**: ForeHOI 在**手部遮挡下的物体遮罩修复**这一细分问题上最专业，是 RAS 最迫切需要解决的痛点。但在场景级重建、6DoF 跟踪、retargeting 等方面，Do as I Do 参考价值更大。建议将 ForeHOI 定位为**手部遮挡问题的专项参考**。
+
+详细分析见 [ForeHOI_reference_analysis.md](ForeHOI_reference_analysis.md)
+
+---
+
+## 二十五、Stage5 中间变量类型 bug
+
+### Q61: mainv2.py 启用 `--enable_stage5 --stage5_method scene_graph` 时报 `AttributeError: 'tuple' object has no attribute 'values'` 怎么办？
+
+**回答**: 这是 `run_stage5()` 中没有解包 `infer_relations_scene_graph()` 返回值的 bug。
+
+**根因**:
+- `tools/infer_relations_scene_graph.py:502` 的返回类型标注为 `tuple`，实际返回 `(refined_relations, vlm_or_None)`，其中第二项是预加载的 VLM 模型/处理器，供 5.2 复用。
+- `mainv2.py:731` 原来直接写成 `refined_relations = infer_relations_scene_graph(...)`，导致 `refined_relations` 实际是整个 tuple，后续 `refined_relations.values()` 时报错。
+- 同样的问题也存在于 `tools/infer_relations_scene_graph.py:731` 的独立入口 `main()` 中。
+
+**修复**:
+1. [mainv2.py:732](file:///mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/mainv2.py#L732) 改为解包：`refined_relations, vlm_for_stage52 = infer_relations_scene_graph(...)`
+2. [mainv2.py:781](file:///mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/mainv2.py#L781) 把 `vlm_for_stage52` 作为 `preloaded_vlm` 传给 5.2 的 `refine_inter_object_relations()`，避免重复加载模型。
+3. [tools/infer_relations_scene_graph.py:731](file:///mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/tools/infer_relations_scene_graph.py#L731) 的独立入口同样改为 `refined, _ = infer_relations_scene_graph(...)`。
+
+**验证**: 已通过 `py_compile` 和针对 `run_stage5()` 的 mock 单元测试，确认返回的 `refined_relations` 为 `dict` 且 `preloaded_vlm` 正确传递。
+
+### Q62: 为什么要在 `.trae/rules/project_rules.md` 里加“测试代码与中间变量”的规则？
+
+**回答**: 这个 bug 是典型的**函数返回 tuple 但调用者按 dict 使用**的中间变量类型错误。为了避免类似问题，规则新增第 6 条，要求：
+
+- 任何修改后必须立即验证；
+- 对分支赋值、函数返回的关键中间变量做最小断言或类型检查（如 `assert isinstance(x, dict)`）；
+- 不依赖“看起来正确”，未经验证的代码视为未完成。
+
+这样可以提前暴露 `tuple/list` 被误当 `dict` 使用、返回结构变更未同步等常见错误。
+
+### Q63: hoi4d_vggt_omega 输出的 6 个 GLB 文件哪个是最终的？调整链路是什么？
+
+**回答**: 根据 `mainv2_20260625_000123.log` 中 `💾 GLB 已保存` 的顺序（行 128/131/575/703/719/724）：
+
+| 文件 | 性质 | 内容 |
+|---|---|---|
+| `final_scene_initial.glb` | 中间 | 基础精修后（仅 table_0 贴地 +0.13m） |
+| `final_scene.glb` | 中间 | 与 initial 内容相同 |
+| `final_scene_stage4.glb` | 中间 | Stage4 后（7/8 物体 ACCEPTED，主要调 scale） |
+| `final_scene_stage5_sp.glb` | 中间 | SP 精修 + 穿模修复后 |
+| `final_scene_stage5.glb` | 中间 | check_stability Phase1-3 后 |
+| **`final_scene_stage4_5.glb`** | **最终** | Stage4+5 全部完成，最后保存 |
+
+调整链路：基础精修(仅table贴地) → Stage4(scale/acc精修) → Stage5.1(VLM关系推断) → Stage5.2 SP(VLM判全correct跳过) → 穿模修复(5次迭代) → check_stability(旋转/z轴对齐) → 最终输出。
+
+### Q64: Stage4 是否被正确使用？为什么感觉没多大调整？
+
+**回答**: Stage4 确实被正确使用，8 个物体中 7 个 ACCEPTED（仅 toy#1 因 accuracy 无提升被 REJECTED）。用户感觉"没多大调整"是因为 **translation 改动确实很小**（0.003~0.105m），但 Stage4 主要调整的是 **scale 和 accuracy**：
+
+- hammer#0: Acc 0.400→0.594 (+48.5%), scale +7.4%
+- table#0: Acc 0.374→0.528 (+41%), scale +11.7%, dt=0.105m
+- cup#0: Acc 0.589→0.625 (+6.1%), scale -20.3%
+- toy#0: Acc 0.187→0.370 (+98%), scale -4.6%
+
+Stage4 设计为"精修"而非"大改"，Phase A（深度对应）和 Phase B（ICP）主要优化 scale 和 rotation，translation 小是正常的。`pose_changes.json` 中缺少 `stage4` 字段，应补上以追踪 Stage4 的 T 矩阵变化。
+
+### Q65: Stage5 穿模修复为什么效果差？
+
+**回答**: 从日志行 692-701，穿模修复存在**反复修复同一对**的问题：
+
+- `toy_3↔cup_0` 在迭代 2-5 中每轮重复出现，分离量不变（0.0105m）
+- `hammer_0↔table_0` 同样在迭代 2-5 中重复，分离量不变（0.1008m）
+
+根因：穿模修复分离物体后，`check_stability` 的 Phase1（贴地）或 Phase2/3（旋转对齐）可能把物体拉回穿模位置。另外 Stage5.2 SP 主循环完全跳过（VLM 对所有物体判定 `correct`），没有任何 SP 几何精修。
+
+修改方向：①穿模修复与 stability 联动锁定已修复对；②穿模检测改用 mesh 相交而非 AABB；③同一对重复出现时增大分离量或换轴；④调整 VLM prompt 使其更严格检查穿模。
+
+### Q66: mainv2.py 是否用上了四阶段对齐？basic_pick_place 视频能对齐吗？
+
+**回答**: **mainv2.py 只调用了 Stage 1**（`align_to_room_coordinate_system`，行 358），没有接入四阶段 fallback。`geometry_utils.py` 中有 5 个对齐函数：Stage1 严格(阈值0.02)、Stage2 放宽(阈值0.05+PCA)、Stage2.5 VLM、Stage3 大平面、Stage4 GeoCalib(图像重力)。
+
+测试 5 个 basic_pick_place 视频（`test_alignment_basic_pick_place.py`）结果：
+- **3/5 视频**：SAM3 找不到 floor（floors=0，桌面场景无地面）→ Stage 1-3 全失败
+- **2/5 视频**：Stage 1 "成功"但 z 轴质量差（z_cos=0.15~0.30，floor 法线几乎水平，说明把桌面/wall 误识别为 floor）
+- **Stage 4 (GeoCalib)**：本机无网络无法下载权重 → 全失败
+
+结论：四阶段对齐在桌面场景基本不可用。建议：①mainv2 接入四阶段级联；②预下载 GeoCalib 权重；③增加 floor 法线质量检查（`|floor_normal[2]| > 0.7`）；④桌面场景识别"桌面"为支撑面。
+
+### Q67: GeoCalib 的 gravity 向量是上方向吗？重力不应该是 z 轴向下吗？
+
+**回答**: 用户判断正确——**重力方向是向下的**，原代码有 bug。
+
+**GeoCalib 的 gravity 约定**（`geocalib/gravity.py`）：
+- `gravity.vec3d` 返回的是**重力方向**（指向地心，即 DOWN）
+- 源码验证：`Gravity.from_rp(roll=0, pitch=0)` 返回 `[0, -1, 0]`（y 轴负方向 = DOWN）
+- 物理含义：相机坐标系下重力把物体往下拉的向量
+
+**原代码 bug**（`src/geometry_utils.py` `align_via_geocalib` 行 653-656 修改前）：
+```python
+# 错误: 把 gravity (DOWN) 直接当 floor_normal (应 UP)
+floor_normal = final_vec.numpy()
+floor_normal = floor_normal / np.linalg.norm(floor_normal)
+```
+
+**修复**（行 649-656 修改后）：
+```python
+# GeoCalib 返回的 gravity 向量指向 DOWN (重力方向)
+# floor_normal 应指向 UP (世界 z 轴正方向) = -gravity
+gravity_vec = final_vec.numpy()  # [3], points DOWN
+floor_normal = -gravity_vec / np.linalg.norm(gravity_vec)  # negate → UP
+```
+
+**经验验证**（5 个 basic_pick_place 视频，统计对齐后 z>0 的点占比）：
+
+| 方案 | 平均 z>0 占比 | 含义 |
+|---|---|---|
+| `floor_normal = gravity`（原错误） | 38.1% | z 轴朝下，场景大部分在 z<0 ❌ |
+| `floor_normal = -gravity`（修复后） | 61.8% | z 轴朝上，场景大部分在 z>0 ✅ |
+
+**结论**：在世界坐标系中，z 轴正方向应朝上（场景在地面之上，z>0）。GeoCalib 的 `gravity` 指向 DOWN，因此 `floor_normal`（朝上的法线）必须取反：`floor_normal = -gravity`。此修复已接入 `mainv2.py` 的 Stage4 fallback。
+
+### Q68: mainv2_technical_doc.md 目前能和代码对应上吗？整个管线和对应的代码有讲解吗？
+
+**回答**: 本次已全面核对 `mainv2_technical_doc.md` 与 `mainv2.py` 代码，修正了多处不一致，并新增了完整的 `main()` 执行流程章节。
+
+**核对前发现的问题**:
+1. `--enable_vlm_dynamic` 参数在文档中多处引用，但**代码中根本不存在**（argparse 未定义）
+2. `--cleanup` 参数在 §4 有完整章节描述，但**代码中也不存在**
+3. `--max_frames` 文档说默认 120，代码实际默认 160
+4. `--max_frames_stage1` 文档说默认 12，代码实际默认 10
+5. `--stage5_method`、`--enable_physics_validation`、`--physics_sim_steps` 代码中存在但文档遗漏
+6. 缺少 `main()` 函数的完整执行流程讲解
+
+**新增章节**: §1 "main() 完整执行流程" (mainv2.py 行 940-1278)，包含:
+- 步骤 0: 初始化与日志配置 (行 942-1001)
+- 步骤 1: Stage 1 物体发现 (行 1003-1010)
+- 步骤 2: Stage 2 3D重建+去重+坐标对齐 (行 1012-1018)
+- 步骤 3: Stage 3 资产生成 (行 1020-1025)
+- 步骤 4: 基础精修 (行 1027-1087，始终执行)
+- 步骤 5: Stage 4 视觉-空间对齐 (行 1089-1109，可选)
+- 步骤 6: Stage 5 语义精修 (行 1111-1166，可选)
+- 步骤 7: 最终输出保存 (行 1203-1235)
+- 步骤 8: 耗时统计 (行 1237-1278)
+- 完整数据流总览图
+
+**修正内容**:
+- §9.1 参数表: 移除 2 个不存在的参数，新增 3 个遗漏参数，修正 2 个默认值
+- §5.2: 标注 VLM 动态检测 "未接入 mainv2"
+- §4: 标注 `--cleanup` "未实现"
+- §1/§2/§8: 移除所有 `--enable_vlm_dynamic` 错误引用
+- §9.4/§9.5: 更新调用示例
+
+**核对结论**: 文档现在与 `mainv2.py` 代码完全对齐。Stage 1-5 函数行号 (206/300/485/640/753)、四阶段坐标系对齐流程 (行 362-411)、pose_changes.json 三段式结构 (行 1207-1235) 全部验证通过。
+
+---
+
+## 十八、坐标系对齐中心点与 z 轴方向
+
+### Q69: z 轴变化时的中心点是怎么选择的？scene 15 和 scene 7 的 log 中分别是怎么选的？
+
+**回答**: 坐标系对齐后的平移向量 `t` 由两部分组成:
+
+1. **`t[2]` (z 轴)**: 用 `floor_centroid` 的旋转后 z 坐标, 将 floor 放到 z=0
+2. **`t[:2]` (xy)**: 用旋转后点云 bbox 中心 `(min+max)/2`, 将 xy 居中到原点
+
+**各阶段 floor_centroid 来源**:
+
+| 阶段 | floor_centroid 来源 | 准确度 |
+|------|---------------------|--------|
+| Stage 1 (`align_to_room_coordinate_system`) | PCA 拟合的 floor 平面质心 `floor_plane_info['centroid']` | ★★★★★ |
+| Stage 2 (`align_via_objects`) | 同 Stage 1 | ★★★★★ |
+| Stage 3 (`align_via_large_plane`) | 大平面 PCA 质心 | ★★★★☆ |
+| Stage 4 (`align_via_geocalib`) | **修复前**: `np.mean(all_points)` (整个点云质心, 非真实 floor) | ★☆☆☆☆ |
+| Stage 4 (`align_via_geocalib`) | **修复后**: `_estimate_floor_centroid` (bottom 10% 点的质心) | ★★★☆☆ |
+
+**Scene 15 log 分析** (`output_v2/15_vggt_omega/mainv2_20260625_172426.log`):
+- Stage 1-3 全部失败 (无可见地面, 桌面场景)
+- Stage 4 GeoCalib "成功": `R[2,2]=0.2259` (但实际偏 77°, 严重失败)
+- **修复前**: floor_centroid = `np.mean(all_points)` → z=0 平面在场景垂直中心, 不是真实 floor
+- **修复后**: floor_centroid = bottom 10% 点的质心 → 更接近真实 floor
+- **R[2,2] 根因**: GeoCalib gravity 在相机坐标系平均, 未变换到世界坐标 (详见 Q70)
+
+**Scene 7 log 分析**:
+- Scene 7 的 `output_v2/7_vggt_omega/` 目录**不存在**, 无法分析具体 log
+- 用户描述的问题: z 轴反了 + 同位置多个物体 + 实例切换
+- z 轴反的根因同 Scene 15: GeoCalib gravity 未做相机→世界坐标变换
+- 修复后, GeoCalib 的 gravity 会正确变换到世界坐标, z 轴方向应该正确
+
+**xy 中心 (bbox center) 的已知问题**:
+- 用 `(min+max)/2` 计算, 对离群点敏感
+- 如果点云有离群点 (如手部云团), bbox 会被拉大, xy 中心偏移
+- 这是所有阶段共有的问题, 暂未修复
+
+**代码位置**: `_build_R_t_from_floor` (`src/geometry_utils.py` 行 310-348)
+
+### Q70: scene 15 的 R[2,2]=0.2259 是怎么造成的？如何判断 z 轴的正负？
+
+**回答**: R[2,2] = floor_normal[2] (世界坐标系下 floor 法线的 z 分量). 理想值 ≈ ±1.0.
+
+**根因** (scene 15 R[2,2]=0.2259):
+
+GeoCalib 返回的 gravity 是**相机坐标系**下的向量, 但代码直接把它当作世界坐标系的 floor_normal 用:
+
+```python
+# 原代码 (错误):
+vec = grav.vec3d.squeeze(0).cpu()  # 相机坐标系
+gravity_vecs.append(vec)            # 直接在相机坐标系平均
+final_vec = spherical_mean(vecs)   # 仍是相机坐标系
+floor_normal = -final_vec           # 相机坐标系的 "UP", 非世界坐标系
+```
+
+当相机 z 轴不与世界 z 轴对齐时 (如相机俯视桌面), 相机坐标系的 "UP" 在世界坐标系中偏离竖直, 导致 R[2,2] 偏小.
+
+**修复** (相机→世界坐标变换):
+
+```python
+# 修复后:
+R_w2c = extrinsics[idx, :3, :3]          # (3,3) world→camera
+grav_world = R_w2c.T @ grav_cam           # camera→world: R_c2w = R_w2c.T
+gravity_world_vecs.append(grav_world)     # 世界坐标系
+# 然后在世界坐标系做球面平均 + MAD 过滤
+floor_normal = -final_vec / norm          # 世界坐标系的 UP
+```
+
+**为什么有效**: gravity 是世界坐标系常量 (永远指向地心). 每帧相机坐标系下的 gravity 不同 (因相机朝向不同), 但变换到世界坐标系后应该一致. 在世界坐标系平均才是正确的.
+
+**z 轴正负的判断**:
+
+1. **GeoCalib 约定**: gravity 指向 DOWN (重力方向), floor_normal = -gravity (UP)
+2. **方向校验** (`_orient_floor_normal`):
+   - 优先用点云质心判断 (场景质心应在 floor 上方)
+   - 当 floor_centroid ≈ all_centroid 时, 用**相机位置**作为 "上方" 参考 (相机总在 floor 上方)
+3. **质量检查** (新增): `abs(R[2,2]) < 0.5` (偏离竖直 > 60°) → 判定对齐失败, 返回 identity
+
+**代码位置**: `src/geometry_utils.py` `align_via_geocalib` (行 564-716)
+
+### Q71: Scene 7 中 "同一位置识别多个物体" 和 "实例突然变成另一个" 怎么解决？
+
+**回答**: 这是两个不同层面的问题:
+
+**问题 1: 同一位置识别多个物体**
+
+- **根因**: SAM3 对 "toy" 类别过度分割 (scene 15 中 toy 有 14 个原始实例). 不同类别可能指向同一物体 (如 banana 同时被识别为 "banana" 和 "toy")
+- **已有机制**: `self_category_deduplicate` (类内去重) + `cross_category_deduplicate` (跨类去重), 用 3D 点云 overlap ratio 合并
+- **新增改进** (`src/sg_deduplication.py`):
+  - 新增**质心距离**计算: `centroid_dist = ||mean(pts_i) - mean(pts_j)||`
+  - **同位置检测**: `centroid_dist < 0.03m` + 不同类别 + 尺寸相近 → 降低 overlap 阈值 (×0.5)
+  - 日志新增 `centroid_dist` 和 `same_pos` 标记
+- **原代码 (`xiac20/ReplicateAnyScene`) 是否有此问题**: 原代码使用相同的 SAM3/SAM3D pipeline, 但物体较少时不易触发. 场景物体多时同样会有此问题
+
+**问题 2: 实例突然变成另一个 (跨类去重)**
+
+- **根因**: SAM3 mask tracking 在遮挡后丢失, 重新检测时可能分配不同类别标签 (如 toy → duck). 由于有些玩具可以归为 "toy" 也可以归为其他类别, 跨类去重需要判断是否同一物体
+- **关键判断**: 点云实例的 3D 空间重叠. 如果遮挡前后物体位置不变 (静态), 3D 重叠高, 跨类去重可以合并. 如果物体移动了 (动态), 3D 位置不同, 无法合并 → 生成多个点云
+- **do-as-i-do 方案** (`malik-group/do-as-i-do`): 用 TAPIR 点跟踪 + guided diffusion 生成, 跟踪更鲁棒. 但这是完全不同的 pipeline, 无法直接移植到当前 SAM3 架构
+- **当前改进**: 同位置检测 (降低 overlap 阈值) 可以捕获部分遮挡后重检测的案例. 对于动态物体移动后的重检测, 需要时序连续性去重 (未来工作)
+
+### Q72: Scene 15 中动态物体遮挡后变成新实例怎么解决？实例效果差、位置不正确怎么办？
+
+**回答**: Scene 15 的核心问题分析:
+
+**问题 1: 动态物体遮挡后变成新实例**
+- **现象**: `toy_4` 只有 `valid_frames=5/51`, SAM3 在遮挡后丢失跟踪 46 帧
+- **根因**: SAM3 mask tracking 基于时序传播, 遮挡后 mask 断裂, 重新检测时生成新实例
+- **当前状态**: `toy_4` 未被类内去重合并 (3D 位置与其他 toy 实例不同, 可能因物体移动)
+- **解决思路**:
+  1. **短期**: 对 `valid_frames < 10` 的实例标记为低置信度, 在 3D 资产验证阶段可选删除
+  2. **长期**: 引入时序连续性去重 — 如果两个实例在时序上首尾相接 (一个消失帧 ≈ 另一个出现帧) 且 2D IoU 高, 则合并
+  3. **参考 do-as-i-do**: 用 TAPIR 点跟踪替代 SAM3 mask tracking, 对遮挡更鲁棒
+
+**问题 2: 实例效果差、位置不正确**
+- **根因**: `R[2,2]=0.2259` (z 轴偏 77°) → 所有物体位置系统性偏移
+- **影响链**: z 轴偏 → floor z=0 平面位置错误 → 所有物体 z 坐标错误 → SP 精修在错误坐标系下调整 → 位置不准
+- **修复**: GeoCalib gravity 相机→世界坐标变换 (Q70) + bottom-percentile floor_centroid + R[2,2] 质量检查
+- **预期效果**: 修复后 R[2,2]≈1.0, z 轴正确对齐, 物体位置准确
+
+**问题 3: duck_0 和 plate_0 误判为动态**
+- **现象**: log 显示 `[STATIC]` 但随后 `[DYNAMIC] 位置调整 offset=0.02-0.03m`
+- **根因**: VGGT 漂移导致首尾帧位置偏移 2-3cm, 虽然标记为 STATIC, 但位置调整逻辑仍被触发
+- **影响**: offset 很小 (2-3cm), 对最终位置影响不大, 但逻辑不一致
+- **暂未修复**: 需要调整位置调整逻辑的触发阈值, 或在 STATIC 标记后跳过位置调整
+
+### Q73: 穿模修复时为什么一直调整小物体的 x,y？如何改为层级调整？Scene 7 需要怎么修复？
+
+**回答**:
+
+**问题 1: 穿模修复调整小物体 x,y 的问题**
+
+旧版 `resolve_penetrations` (`tools/refine_inter_object_placement.py`) 在穿模修复时, 对所有物体一视同仁:
+- 用 FCL 检测穿模方向 (sep_axis 可能是 x/y/z 任意轴)
+- 沿 sep_axis 方向推开, 没有区分大物体 (supporter) 和小物体 (supported)
+- 导致小物体 (如 bottle, cup) 被独立推开 x/y, 脱离支撑物 (table) 顶面
+
+**修复方案: 层级穿模修复 (floor → 大物体 → 小物体)**
+
+在 `refine_inter_object_placement.py` 中做了三处修改:
+
+1. **构建 supporter→supported 映射** (行 1231-1255):
+   - 从 `refined_relations` 解析 "bottle_0": "supported by table_1" 这类关系
+   - 构建 `{("table", 1): [("bottle", 0), ("bowl", 0), ...]}` 映射
+
+2. **小物体只允许 z 轴移动** (行 1329-1331):
+   ```python
+   if move_is_supported and sep_axis != 2:
+       sep_axis = 2  # 强制 z 轴
+   ```
+   - 小物体 (supported) 穿模时, 不沿 x/y 推开, 只沿 z 轴上移
+   - 保留 x,y 不变, 维持与支撑物的相对位置
+
+3. **supporter 移动时传播 x,y delta** (行 1374-1391):
+   - 当大物体 (table) 移动时, 计算其 x,y 偏移量
+   - 将同样的 x,y 偏移应用到其所有 supported 物体
+   - 实现层级跟随: table 移动 → bottle/cup/bowl 跟随
+
+4. **小物体之间使用更小的分离余量** (行 1345-1346):
+   ```python
+   if both_small:
+       sep_dist = pen_depth + 0.005  # 小物体间 5mm 余量
+   ```
+   - 对比大物体的 0.10m / 0.05m 余量, 小物体间只需 5mm
+
+**验证状态**: 语法检查通过 (`ast.parse`), 静态代码审查确认逻辑正确。功能测试脚本 `tools/_test_hierarchical_penetration.py` 已创建, 但当前环境无 trimesh 无法运行。
+
+**问题 2: Scene 7 的修复**
+
+Scene 7 (`output_v2/7_vggt_omega`) 是用**旧代码**生成的, 关键证据:
+- **无 `coordinate_alignment.json`** — mainv2.py 行 409-412 显示该文件**总是**会创建
+- `pose_changes.json` 无 `coordinate_alignment` 部分
+- 所有 `delta_from_initial` = [0,0,0] — 完全没有发生精修
+
+**Scene 7 数据分析发现的问题**:
+
+| 问题 | 具体数据 | 已有修复 |
+|------|---------|---------|
+| 同位置多物体 | duck_0 (0.20,-0.23,0.17) vs plate_0 (0.18,-0.24,0.16), 距离 0.024m < 0.03m 阈值 | `sg_deduplication.py` 行 282: same_position 检测 |
+| 实例切换 | duck_1 仅 2 帧可见 (111,112), 是遮挡后误识别 | `sg_deduplication.py` 跨类去重 |
+| 离群实例 | toy_5 仅 7 帧可见 (36-42), z=0.04 异常低 | 跨类去重 + 低置信度过滤 |
+| z 轴未对齐 | 无 coordinate_alignment.json | `geometry_utils.py` GeoCalib gravity 相机→世界变换 (行 622-628) |
+| 无精修 | 所有 delta=[0,0,0] | 关系 "supported by other objects" → 需更新代码推断为 "supported by floor" |
+
+**修复方案**: Scene 7 需要用更新后的 mainv2.py 重新运行。三个核心修复已在代码中:
+1. **GeoCalib z 轴修复** (`src/geometry_utils.py` 行 564-698): gravity 相机→世界坐标变换, bottom-10% floor_centroid, R[2,2] 质量检查
+2. **跨类去重同位置检测** (`src/sg_deduplication.py` 行 275-309): centroid_dist < 0.03m → 降低合并阈值
+3. **层级穿模修复** (`tools/refine_inter_object_placement.py` 行 1231-1396): 见上方问题 1
+
+**重运行命令** (需在含 trimesh/torch/GPU 的环境中执行):
+```bash
+python3 mainv2.py --input_images <原始输入> --output_path output_v2/7_vggt_omega --vggt_model vggt_omega
+```
+
+### Q74: GeoCalib gravity 方向判断正确吗？`grav_world = R_w2c.T @ grav_cam` 会不会影响最终结果？坐标系变换如何记录到 json？
+
+**回答**:
+
+**1. `grav_world = R_w2c.T @ grav_cam` 是正确的**
+
+VGGT 输出的 `predictions["extrinsics"]` 是 **w2c (world→camera)** 矩阵, 约定:
+```
+p_cam = R_w2c @ p_world + t_w2c
+```
+证据: `test_scannet.py:260` 用 `camera_pos = -extrinsic[:3, :3].T @ extrinsic[:3, 3]` 提取相机位置, 这是标准的 w2c 相机位置公式 (`-R.T @ t`).
+
+GeoCalib 返回的 gravity 是**相机坐标系**下的向量 (指向 DOWN). 要在世界坐标系做球面平均, 必须先用 `R_c2w = R_w2c.T` 变换到世界坐标系:
+```python
+grav_world = R_w2c.T @ grav_cam   # = R_c2w @ grav_cam, camera→world
+```
+这个变换是正确的, 不会对最终结果产生不良影响.
+
+**2. Scene 7 z 轴方向反转的真正根因: `camera_positions` 提取 bug**
+
+`_orient_floor_normal` 在退化情况 (`floor_centroid ≈ all_centroid`) 下, 用相机位置判断 "上方":
+```python
+mean_cam = np.mean(camera_positions, axis=0)
+if np.dot(mean_cam - floor_centroid, floor_normal) < 0:
+    return -floor_normal
+```
+
+但 `camera_positions` 提取错误:
+```python
+# 错误: extrinsics[:, :3, 3] 是 w2c 的 t (平移), 不是相机位置!
+camera_positions = extrinsics[:, :3, 3]
+
+# 正确: 相机位置 = -R.T @ t (w2c 的逆变换)
+camera_positions = -np.einsum('nji,nj->ni', R_w2c_all, t_w2c)
+```
+
+t 和相机位置方向可能相反, 导致 `mean_cam - floor_centroid` 方向判断出错,
+floor_normal 朝下 → z 轴方向反转. **这才是 Scene 7 z 轴方向反转的根因**, 已修复.
+
+**3. 坐标系变换记录到 json**
+
+`coordinate_alignment.json` 现在包含完整的坐标系变换信息:
+```json
+{
+  "extrinsics_convention": "w2c (world→camera): p_cam = R @ p_world + t",
+  "camera_position_formula": "cam_pos = -R_w2c.T @ t_w2c (不是 t 本身)",
+  "method_detail": {
+    "alignment_stage": "stage1_strict / geocalib / ...",
+    "R": [[...]],
+    "t": [...],
+    "gravity_transform": "grav_world = R_w2c.T @ grav_cam (= R_c2w @ grav_cam, camera→world)",
+    "camera_position_transform": "cam_pos = -R_w2c.T @ t_w2c (w2c 的 t 不是相机位置)",
+    "floor_centroid": [x, y, z],
+    "extrinsics_before_first_frame": [[...]],
+    "extrinsics_after_first_frame": [[...]]
+  }
+}
+```
+
+相关代码:
+- `src/geometry_utils.py` 行 627-628: `grav_world = R_w2c.T @ grav_cam`
+- `src/geometry_utils.py` 行 689: `camera_positions = -np.einsum('nji,nj->ni', R_w2c_all, t_w2c)` (修复后)
+- `mainv2.py` 行 400-410: `coordinate_alignment.json` 写入逻辑
+
+### Q75: `relations_scene_graph.json` 用来修复穿模吗？小物体怎么定义？处理流程是什么？
+
+**回答**:
+
+**1. 是的, `relations_scene_graph.json` 现在用于穿模修复**
+
+`resolve_penetrations` 新增 `scene_dir` 参数, 优先从 `relations_scene_graph.json` 加载
+`scene_graph_objects` 的 parent 层级, 构建 `supporter_to_supported` 映射.
+
+**2. 小物体定义: 基于场景图 parent 层级 (不是字符串解析)**
+
+用户明确: "小物体指的是层级比较低的物体, 和父辈不一样".
+
+- `parent == 1` → **大物体** (supporter, 直接放在 floor 上), 自由调整 x/y/z
+- `parent != 1` → **小物体** (supported, 父辈是其他物体), 只 z 轴移动 + 跟随 supporter x/y
+
+**比字符串解析 "supported by X" 更可靠**, 直接使用 scene graph 的 parent ID.
+
+**3. 处理流程 (floor → 大物体 → 小物体)**
+
+```
+1. 穿模检测: AABB 预筛 + FCL 精确检测
+2. 移动物体选择 (层级优先):
+   - 一方是 supported (小物体) → 移小物体
+   - 一方是 floor/wall → 移另一方
+   - 两方同级 → 移中心位置较高者
+3. 小物体 z-only 强制: if move_is_supported and sep_axis != 2: sep_axis = 2
+4. 分离余量分级:
+   - both_small (双方都小物体): pen_depth + 0.005m
+   - max_size > 0.5m: pen_depth + 0.10m
+   - max_size > 0.3m: pen_depth + 0.05m
+   - 其他: pen_depth + 0.01m
+5. 应用 T 矩阵 + 地面约束 (z >= 0)
+6. 层级传播: 大物体移动时, 小物体跟随 x/y (不跟随 z)
+7. 迭代 (最多 8 次)
+```
+
+**4. Scene 7 特殊情况**
+
+Scene 7 的 `relations_scene_graph.json` 中所有 9 个物体 `parent` 都是 `1` (floor):
+- `supporter_to_supported` 为空 (无层级)
+- `supported_names` 为空 (无小物体)
+- 所有物体一视同仁, 正常穿模修复 (无 z-only 限制, 无 xy 跟随)
+
+这是正确行为: Scene 7 物体都直接放在地板上, 无层级关系.
+
+**5. 调用站点 (3 处)**
+
+| 位置 | scene_dir 来源 |
+|------|----------------|
+| `mainv2.py:1102-1104` | `args.output_path` |
+| `run_post_pipeline.py:458-460` | 函数参数 |
+| `refine_inter_object_placement.py:2030-2032` | 函数参数 |
+
+**6. 层级加载方式 (优先 A, 回退 B)**
+
+- **方式 A (优先)**: 从 `relations_scene_graph.json` 的 `scene_graph_objects` 加载 parent 层级
+- **方式 B (回退)**: 从 `refined_relations` 字符串解析 "supported by X" (当文件不存在时)
+
+详细文档见 `docs/mainv2_technical_doc.md` §6.5 层级穿模修复.
+
+### Q76: 穿模修复代码在哪里？Stage5 现在是什么情况？为什么只看到一个修复？Stage5 具体修复写在文档里了吗？能举个 output_v2 的具体例子说明管线怎么运行吗？
+
+**回答**:
+
+#### 1. 穿模修复代码位置
+
+穿模修复的核心函数是 `resolve_penetrations`, 位于:
+- [tools/refine_inter_object_placement.py](file:///mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/tools/refine_inter_object_placement.py) 行 1180-1450
+
+#### 2. 管线中 `resolve_penetrations` 的调用次数 (关键: 为什么"只看到一个修复")
+
+`resolve_penetrations` 在 mainv2.py 管线中有 **2 个潜在调用点**, 但行为不同:
+
+| 调用点 | 位置 | dry_run | 何时执行 | 实际修复? |
+|--------|------|---------|---------|----------|
+| Stage4 块 | [mainv2.py:1103](file:///mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/mainv2.py#L1103) | **True** | `--enable_stage4` 时 | **否 (仅检测警告)** |
+| Stage5.2 内部 | [refine_inter_object_placement.py:2034](file:///mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/tools/refine_inter_object_placement.py#L2034) | False | `--enable_stage5` 时 | **是 (真实修复)** |
+
+**"只看到一个修复"的原因**:
+
+1. **如果只启用 Stage4 (没启用 Stage5)**: Stage4 的穿模修复是 `dry_run=True` (只检测, 打印警告, 不修改 T 矩阵). 所以你看到穿模警告但没有实际修复 → 感觉"没有修复".
+
+2. **如果启用 Stage5**: 真正的穿模修复发生在 Stage5.2 的 `refine_inter_object_relations` 内部 (行 2034). 但 `pose_changes.json` 只记录一个 `stage5` 条目, **不区分 5.1/5.2/穿模修复/稳定性检查**, 所以看起来只有一个修复记录.
+
+3. **`pose_changes.json` 的 stages 字段**: 典型场景只有 `['initial', 'basic_refinement', 'stage5']` 三个阶段, **没有 'stage4' 记录** (Stage4 不单独记录位姿变化). 这也是"只看到一个修复"的原因 — Stage5 把所有子步骤合并成一条记录.
+
+#### 3. Stage5 实际做什么 (3 个子步骤)
+
+Stage5 ([mainv2.py:1118-1170](file:///mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/mainv2.py#L1118)) 由 `run_stage5` 函数 ([行 756-842](file:///mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/mainv2.py#L756)) 执行:
+
+```
+Stage5 (run_stage5)
+├── 5.1 关系推断 (infer_relations_scene_graph / refine_other_objects_relations)
+│   └── 输出 refined_relations.json (如 "cup_0 supported by table_0")
+├── 5.2 SP精修 (refine_inter_object_relations) ← 穿模修复在这里!
+│   ├── VLM 判定放置策略 (on_top/inside/against_side/...)
+│   ├── SP 几何精修 (z 对齐到 supporter 顶面)
+│   ├── resolve_penetrations (穿模修复, 行 2034) ← 真实修复
+│   └── check_stability (稳定性检查, 行 2062)
+└── 5.3 物理仿真验证 (可选, --enable_physics_validation, SAPIEN)
+```
+
+**关键**: Stage5.2 的 `refine_inter_object_relations` 内部会调用 `resolve_penetrations` (真实修复) + `check_stability` (稳定性), 但这些不单独记录到 pose_changes.json.
+
+#### 4. 文档位置
+
+Stage5 的具体修复**已写在** [docs/mainv2_technical_doc.md](file:///mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/docs/mainv2_technical_doc.md):
+- §6 SP精修逻辑 (行 945-1135): 五种放置策略 + 层级穿模修复 (§6.5)
+- §1 步骤6 (行 197): Stage5 执行流程
+- §3.3 (行 598): Stage 5.2 物体间 SP 精修
+
+#### 5. 具体例子: `output_v2/271_vggt_omega` (有真实层级)
+
+**271 场景的层级关系** (来自 `relations_scene_graph.json`):
+
+```
+floor (id=1, parent=1)  ← 地板
+└── table_0 (id=7, parent=1)  ← 大物体 (直接放在地板)
+    ├── crystal_0 (id=3, parent=7)  ← 小物体 (放在桌上)
+    ├── crystal_1 (id=4, parent=7)  ← 小物体 (放在桌上)
+    ├── plate_0 (id=5, parent=7)   ← 小物体 (放在桌上)
+    └── square_0 (id=6, parent=7)  ← 小物体 (放在桌上)
+```
+
+**管线运行流程** (以 271 为例):
+
+```
+1. Stage1 (物体发现): 检测到 table/crystal/plate/square → all_instances
+2. Stage2 (3D重建): VGGT 点云 + 坐标对齐 → 物体初始 T 矩阵
+3. Stage3 (资产生成): TRELLIS 生成 3D mesh
+4. 基础精修: refine_supported_by_floor_object (table 贴地 z=0)
+   → pose_changes.json 记录 "basic_refinement"
+5. Stage4 (可选, --enable_stage4): ICP+MASt3R 对齐
+   → resolve_penetrations(dry_run=True) 仅检测穿模 (不修复)
+   → ⚠️ pose_changes.json 不记录 stage4
+6. Stage5 (--enable_stage5):
+   5.1 infer_relations_scene_graph → 生成 "crystal_0 supported by table_0" 等关系
+   5.2 refine_inter_object_relations:
+       - VLM 判定: crystal 放在 table 上是 "on_top" 策略
+       - SP 精修: crystal.bottom_z 对齐到 table.top_z
+       - resolve_penetrations: 检测 crystal↔crystal 穿模, 小物体 z-only 修复
+       - check_stability: 检查 crystal 是否稳定在 table 上
+   → pose_changes.json 记录 "stage5" (合并 5.1+5.2+穿模+稳定性)
+```
+
+**271 的 pose_changes.json 实际数据**:
+```
+crystal_0: relation="supported by table"  ← 小物体 (parent=7=table)
+crystal_1: relation="supported by table"  ← 小物体
+plate_0:   relation="supported by table"   ← 小物体
+square_0:  relation="supported by table"   ← 小物体
+table_0:   relation="supported by floor"   ← 大物体 (parent=1=floor)
+```
+
+**层级穿模修复在 271 的效果**: 当 table 移动时, crystal/plate/square 跟随 table 的 x/y 移动 (不独立调整 x/y); 当 crystal 之间穿模时, 只在 z 轴分离 (不调 x/y).
+
+### Q77: Stage4 是什么情况？调用它对系统有影响吗？mainv2 里只是调整 scale 吗？
+
+**回答**:
+
+#### 1. Stage4 实际做什么
+
+Stage4 = **迭代视觉-空间对齐** (ICP + MASt3R + Umeyama 相似变换), 位于 [mainv2.py:643-753](file:///mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/mainv2.py#L643) 的 `run_stage4` 函数.
+
+**核心流程**:
+```
+run_stage4 (mainv2.py 行 643-753)
+├── 1. 选择 real mask: 优先 SAM 分割 mask (M_real), 回退深度 mask
+├── 2. 计算最优帧: compute_optimal_frame_ids
+├── 3. 逐实例对齐 (refine_single_instance_combined):
+│   ├── Phase A: MASt3R/深度匹配 → 3D Lifting
+│   │   └── Umeyama 相似变换 (含 scale, rotation, translation)
+│   └── Phase B: ICP 精调 (渐进阈值 + RANSAC)
+└── 4. (mainv2) resolve_penetrations(dry_run=True) — 仅检测穿模
+```
+
+#### 2. "只是调整 scale 吗?" — 不完全是
+
+Stage4 的 Umeyama 相似变换**包含 scale, 但不只有 scale**:
+- **scale (尺度)**: 修正 3D 资产与点云的尺寸差异
+- **rotation (旋转)**: 修正朝向偏差
+- **translation (平移)**: 修正位置偏差
+
+scale 是 Umeyama 相似变换的一部分 ([stage4/combined_alignment.py](file:///mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/stage4/combined_alignment.py) 的 `refine_single_instance_combined` 内部), 不是独立步骤.
+
+**之后还有 ICP 精调** (Phase B), 进一步优化旋转和平移 (不改 scale).
+
+#### 3. "调用它对系统有影响" — 是的, 计算量大
+
+Stage4 对系统的影响:
+- **GPU 内存**: MASt3R 匹配需要大量 GPU 内存 (每对帧做 2D 特征匹配 + 3D lifting)
+- **计算时间**: 每个实例都要跑 MASt3R + ICP, 实例多时很慢
+- **CPU**: ICP 精调是 CPU 密集型 (点云配准)
+- **内存**: 需要保存 world_points (T×H×W×3) + 置信度
+
+**所以 Stage4 默认关闭** (需要 `--enable_stage4` 显式启用).
+
+#### 4. mainv2 vs run_post_pipeline 的 Stage4 差异
+
+| 维度 | mainv2.py | run_post_pipeline.py |
+|------|-----------|----------------------|
+| real mask | 优先 SAM mask (M_real), 回退深度 mask | 直接深度 mask (无 SAM) |
+| 置信度 | 真实 `world_points_conf` | 全 1 (`np.ones_like`) |
+| wall 物体处理 | 反算 camera_pos | 不处理 |
+| 穿模修复 | `resolve_penetrations(dry_run=True)` 仅检测 | `resolve_penetrations` 真实 + `check_stability` |
+| 位姿记录 | 不记录 stage4 | 不记录 stage4 |
+
+⚠️ **注意**: `run_post_pipeline.py` 的 `run_stage4` (行 458-462) 引用了未定义的 `categories_and_relations` (该变量在 `run_stage4` 函数作用域内不存在, 会触发 `NameError`). 这是 latent bug, 但 mainv2.py 不受影响 (mainv2 在 main() 作用域调用 resolve_penetrations).
+
+#### 5. Stage4 不记录位姿变化
+
+`pose_changes.json` 中**没有 'stage4' 阶段** — `_record_pose_stage` 从不为 Stage4 调用 (见 [mainv2.py](file:///mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/mainv2.py) 行 1051/1078/1133/1162/1199, 只记录 initial/basic_refinement/stage5/physics). 如果想看 Stage4 的效果, 需对比 `final_scene.glb` (Stage4 前) 和 `final_scene_stage4.glb` (Stage4 后).
+
+### Q78: 121 场景有什么问题？动态物体取首帧策略对吗？点云怎么处理？
+
+**回答**:
+
+#### 1. 121 场景的 z 轴没问题
+
+121 的 `coordinate_alignment.json`:
+- `alignment_stage = "stage1_strict"` (用 `align_to_room_coordinate_system`)
+- `R[2,2] = -0.7558` (负数)
+
+**用户确认**: 121 的 z 轴方向是正确的, R[2,2] 负值在这个场景下是正常的 (不一定是 z 轴反转). 之前误判为 bug 是错误的.
+
+#### 2. 动态物体取首帧策略 — 正确
+
+当前策略 ([mainv2.py:562-612](file:///mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/mainv2.py#L562)):
+1. Mesh 用**最大表面积帧**生成 (最完整建模)
+2. 动态物体位置偏移到**首帧质心** (`T[:3,3] += first_centroid - optimal_centroid`)
+
+**用户确认**: 动态物体就是要放在出现首帧的位置, 这个策略是对的.
+
+#### 3. 点云处理 — 剔除其他帧的残影点云 (本次新增)
+
+**问题**: 动态物体在运动, 其在其他帧的点云是"残影" (位置不同), 会污染下游:
+- SP精修的 supporter.top_z 被残影拉偏
+- Stage4 ICP 被动态点云干扰
+- 坐标对齐的 floor/wall 检测被影响
+
+**策略** ([mainv2.py:598-611](file:///mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/mainv2.py#L598), 本次新增):
+- 动态物体**只保留首帧点云** (物体放置位置)
+- 其余帧该实例 mask 区域的 `world_points` 置 `NaN`
+- 首帧点云保留 → 用于位置确认和 SP 精修
+
+```python
+# 保留 first_visible_frame_id 的点云, 其余帧该实例 mask 区域置 NaN
+for im_entry in sorted_masks:
+    fid_clean = im_entry['frame_id']
+    if fid_clean == first_visible_frame_id:
+        continue  # 保留首帧
+    mask_clean = im_entry['mask']
+    vggt_prediction_results['world_points'][fid_clean][mask_clean > 0] = np.nan
+```
+
+**为什么用 NaN 而非 0**: 0 会被误认为"原点处的有效点", NaN 会被 `np.isfinite` / `> 0` 等自然过滤.
+
+**注意**: 此清理在坐标系对齐 (行 363) **之后**执行, 不影响已完成的对齐. 影响下游 Stage4/Stage5/SP精修.
+
+#### 4. 验证器不校验位置 (已有问题, 本次不修)
+
+`asset_verifier.py` 的三票验证只看: 尺寸 / 置信度 / VLM 外观. **不校验 mesh 放置位置是否与点云质心对齐**. 这是已有设计, 本次不修改.
+
+#### 5. 121 的层级关系 (丰富, 适合层级穿模修复测试)
+
+```
+floor (id=1)
+├── wall (id=2)
+│   └── door_0 (id=13, parent=2)  ← 嵌入墙体
+├── table_0 (id=16, parent=1)     ← 大物体
+│   ├── bowl_1 (id=6, parent=16)
+│   ├── cup_1 (id=12, parent=16)
+│   └── scissor_0 (id=14, parent=16)
+├── table_1 (id=17, parent=1)     ← 大物体
+│   ├── bottle_0 (id=3, parent=17)
+│   ├── bottle_1 (id=4, parent=17)
+│   ├── bowl_0 (id=5, parent=17)
+│   ├── box_0 (id=7, parent=17)
+│   ├── car_0 (id=9, parent=17)
+│   ├── car_1 (id=10, parent=17)
+│   ├── cup_0 (id=11, parent=17)
+│   └── scissor_1 (id=15, parent=17)
+└── cabinet_0 (id=8, parent=1)    ← 大物体
+```
+
+121 有 2 个 table + 1 个 cabinet 作为大物体, 13 个小物体分布在不同 supporter 上. 这是层级穿模修复的理想测试场景.
+
+### Q79: 生成的 GLB 里面能标注物体是什么吗？单独 GLB 能给出物体信息吗？还是用 JSON 说明？
+
+**回答**:
+
+#### 1. 当前 GLB 已经包含物体名称 (node.name)
+
+从实际 GLB 文件 (`output_v2/044_C2_Mug_high_onehand_vggt_omega/final_scene.glb`) 提取的 JSON 结构:
+
+```json
+"nodes": [
+  {"name": "world", "children": [1,2,3,4,5]},
+  {"name": "grid_z0", "mesh": 0, "matrix": [...]},
+  {"name": "chair_0", "mesh": 1, "matrix": [...]},
+  {"name": "cup_0",   "mesh": 2, "matrix": [...]},
+  {"name": "fan_0",   "mesh": 3, "matrix": [...]},
+  {"name": "table_0", "mesh": 4, "matrix": [...]}
+]
+```
+
+**每个物体已经是 `node.name = "{category}_{instance_idx}"`** (如 `table_0`, `cup_0`), 通过 [mainv2.py:894](file:///mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/mainv2.py#L894) 的 `scene.add_geometry(mesh, node_name=f"{category}_{i}")` 实现. 在 Blender / Isaac Sim / Three.js 等工具中打开 GLB, 可以直接看到这些节点名称.
+
+#### 2. 当前 GLB 没有 extras (自定义元数据)
+
+```json
+"meshes": [{"name": "geometry_0", "extras": {}}, ...]
+```
+
+`extras` 是空字典 `{}`. glTF 2.0 规范支持每个 node/mesh 携带任意 JSON 的 `extras` 字段, 但 trimesh 导出时**不会自动把 mesh.metadata 写入 extras** (实测确认).
+
+#### 3. 建议: GLB node.name + JSON 详细信息 (当前方案, 推荐)
+
+| 信息类型 | 存放位置 | 示例 |
+|---------|---------|------|
+| 物体名称 | GLB `node.name` | `"table_0"` |
+| 实例索引 | GLB `node.name` (后缀) | `_0` |
+| 类别 | GLB `node.name` (前缀) | `table` |
+| 支撑关系 | `relations_scene_graph.json` | `"supported by table"` |
+| 父物体 ID | `relations_scene_graph.json` | `parent: 17` |
+| 位姿 T 矩阵 | `pose_changes.json` | 4×4 矩阵 |
+| display_id | `relations_scene_graph.json` | `id: 5` |
+
+**关联方式**: GLB 的 `node.name` 与 `relations_scene_graph.json` 的 `category_to_display_ids` 对应:
+```json
+"category_to_display_ids": {"table": [17], "cup": [11]}
+```
+`table_0` → `category_to_display_ids["table"][0]` = display_id 17.
+
+**优点**:
+- GLB 自带名称, 可直接在 3D 工具中识别物体
+- 详细信息 (关系/层级/位姿) 在 JSON 中, 便于程序化处理
+- 不依赖 trimesh 的 extras 支持 (实测不稳定)
+
+#### 4. 如果要 GLB 自带完整 extras
+
+可以用 `pygltflib` 库在导出后注入 extras:
+```python
+# 伪代码: 导出 GLB 后, 用 pygltflib 注入 node extras
+from pygltflib import GLTF2
+gltf = GLTF2().load(glb_path)
+for node in gltf.nodes:
+    if node.name == "table_0":
+        node.extras = {"category": "table", "relation": "supported by floor",
+                       "parent": 1, "instance_idx": 0}
+gltf.save(glb_path)
+```
+
+但需要额外依赖 `pygltflib`, 且不是所有工具都能读取 extras. **当前 node.name + JSON 方案已足够**.
+
+### Q80: z=0 的平面是怎么确定的？
+
+**回答**:
+
+#### 核心逻辑
+
+z=0 平面 = **floor_centroid (地面质心) 所在的水平面**.
+
+关键代码在 [geometry_utils.py:337-339](file:///mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/src/geometry_utils.py#L337) (`_build_R_t_from_floor`):
+
+```python
+R = np.stack([wall_normal_1, wall_normal_2, floor_normal], axis=0)  # 旋转矩阵
+rotated_floor_centroid = floor_centroid @ R.T  # 把 floor_centroid 转到新坐标系
+t = np.zeros(3)
+t[2] = -rotated_floor_centroid[2]  # 平移: 使 floor_centroid 的 z = 0
+```
+
+变换后, `p_new = R @ p_old + t`, floor_centroid 的新 z 坐标 = `rotated_floor_centroid[2] + t[2] = 0`.
+
+#### floor_centroid 的来源 (按对齐阶段)
+
+| 对齐阶段 | floor_centroid 来源 | floor_normal 来源 |
+|---------|---------------------|-------------------|
+| Stage1 strict (`align_to_room_coordinate_system`) | floor mask 的 PCA 平面拟合质心 | floor mask 的 PCA 最小特征值方向 |
+| Stage2 relaxed (`align_via_objects`) | floor mask 的 PCA 平面拟合质心 | 同上, 用 `_orient_floor_normal` 朝上 |
+| Stage3 large_plane (`align_via_large_plane`) | floor mask 的 PCA 平面拟合质心 | 同上 |
+| Stage4 GeoCalib (`align_via_geocalib`) | `_estimate_floor_centroid`: **最低 10% 点的质心** | `-gravity` (GeoCalib 重力反方向) |
+
+#### floor_centroid 的计算方式
+
+**Stage1-3** (有 floor mask):
+```python
+# get_plane_info (geometry_utils.py 行 176-209)
+masked_points = pointmap[mask]  # floor mask 区域的 3D 点
+centroid = np.mean(masked_points, axis=0)  # 质心
+# PCA: 最小特征值的特征向量 = 平面法线
+cov_matrix = np.dot(centered_points.T, centered_points)
+eigenvalues, eigenvectors = np.linalg.eig(cov_matrix)
+normal = eigenvectors[:, np.argmin(eigenvalues)]
+```
+
+**Stage4 GeoCalib** (无 floor mask, 用重力):
+```python
+# _estimate_floor_centroid (geometry_utils.py 行 280-288)
+projections = all_points @ floor_normal  # 所有点在 floor_normal 方向的投影
+threshold = np.percentile(projections, 10)  # 最低 10%
+bottom_mask = projections <= threshold
+floor_centroid = np.mean(all_points[bottom_mask], axis=0)  # 最低 10% 点的质心
+```
+
+#### floor_normal 方向确定 (朝上)
+
+`_orient_floor_normal` ([geometry_utils.py:291-307](file:///mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/src/geometry_utils.py#L291)):
+1. **优先**: 场景质心在 floor_centroid 上方 → `np.dot(all_centroid - floor_centroid, floor_normal) > 0` → 朝上
+2. **回退** (质心重叠时): 相机位置在 floor 上方 → `np.dot(mean_cam - floor_centroid, floor_normal) > 0` → 朝上
+
+#### 在 GLB 中的体现
+
+[mainv2.py:879-887](file:///mnt/data_8THDD/lza/workspace/robot_world_ws/src/ReplicateAnyScene/mainv2.py#L879) 在 z=0 处画了一个网格 (`grid_z0`) 标注地面:
+```python
+# 添加虚拟水平面标注 (z=0处的网格线)
+grid_lines = []
+for v in np.arange(-5.0, 5.0 + 0.5, 0.5):
+    grid_lines.append(trimesh.load_path(np.array([[v, -5, 0], [v, 5, 0]])))
+    grid_lines.append(trimesh.load_path(np.array([[-5, v, 0], [5, v, 0]])))
+grid = trimesh.util.concatenate(grid_lines)
+scene.add_geometry(grid, node_name="grid_z0")
+```
+
+这个网格就是 z=0 平面 (地面) 的可视化标注, 在 GLB 中显示为一个 10m×10m 的网格线.
+
+
+
+
